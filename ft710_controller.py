@@ -284,6 +284,8 @@ I18N = {
     'lbl.enable.video':   {'zh': '启用视频捕获',     'en': 'Enable Video Capture'},
     'dlg.about.title':    {'zh': '关于',             'en': 'About'},
     'lbl.about.ver':      {'zh': '版本  v{ver}',     'en': 'Version  v{ver}'},
+    'lbl.about.email':    {'zh': '邮箱  {e}',       'en': 'Email  {e}'},
+    'lbl.about.qq':       {'zh': 'QQ交流群  {q}',  'en': 'QQ Group  {q}'},
     'lbl.about.log':      {'zh': '日志保存：24小时循环滚动', 'en': 'Logs kept: 24h rolling'},
     'btn.close':          {'zh': '关闭',             'en': 'Close'},
     'btn.apply':          {'zh': '应用',             'en': 'Apply'},
@@ -1329,6 +1331,70 @@ def send_ex_menu(p1, p2, p3, value="", delay=0.05):
             log(f"EX命令失败：{e}")
     return ""
 
+def read_yaesu(cmd, delay=0.25):
+    """发送CAT查询命令并返回电台响应字符串（失败或超时返回""）"""
+    global ser
+    try:
+        if not ser or not ser.is_open:
+            return ""
+        raw = build_yaesu_cmd(cmd, "")
+        with lock:
+            try:
+                ser.reset_input_buffer()
+            except:
+                pass
+            ser.write(raw.encode('ascii'))
+            time.sleep(delay)
+            resp = ser.read_until(b';')
+        if resp:
+            txt = resp.decode('ascii', errors='ignore').strip()
+            log(f"读取电台：{txt}")
+            return txt
+    except Exception as e:
+        log(f"读取电台失败：{e}")
+    return ""
+
+_MODE_REVERSE = {
+    '01': 'LSB', '02': 'USB', '03': 'CW', '04': 'FM',
+    '05': 'AM', '09': 'CWR', '0C': 'RTTY',
+}
+
+def sync_radio_state():
+    """从电台读取当前频率/模式/功率并同步到状态（启动与自动重连时调用）"""
+    if not (ser and ser.is_open):
+        return False
+    ok = False
+
+    fa = read_yaesu("FA")
+    if fa.startswith("FA") and len(fa) >= 11:
+        try:
+            freq_hz = int(fa[2:11])
+            if 0 < freq_hz <= 54000000:
+                radio_state['frequency'] = freq_hz / 1e6
+                log(f"同步频率: {radio_state['frequency']:.3f} MHz")
+                ok = True
+        except Exception:
+            pass
+
+    md = read_yaesu("MD")
+    if md.startswith("MD") and len(md) >= 4:
+        mode = _MODE_REVERSE.get(md[2:4].upper())
+        if mode:
+            radio_state['mode'] = mode
+            log(f"同步模式: {mode}")
+            ok = True
+
+    pc = read_yaesu("PC")
+    if pc.startswith("PC") and len(pc) >= 5:
+        try:
+            radio_state['power'] = max(0, min(100, int(pc[2:5])))
+            log(f"同步功率: {radio_state['power']}%")
+            ok = True
+        except Exception:
+            pass
+
+    return ok
+
 def init_yaesu_radio():
     """初始化Yaesu电台"""
     try:
@@ -1366,6 +1432,7 @@ def init_yaesu_radio():
             send_ex_menu(1, p2_val, 11, "050", 0.05)  # USB OUT LEVEL = 50
 
         log("Yaesu FT-710 初始化完成")
+        sync_radio_state()
         return True
     except Exception as e:
         log(f"Yaesu初始化失败：{e}")
@@ -1391,6 +1458,10 @@ def init_com(port=None, baud=None):
             radio_state["audio_status"] = _t('srv.audio.errcmd', e=str(e))
             return False
     init_yaesu_radio()
+    # 启动时强制默认功率 25W（25%），覆盖电台原有功率设置
+    send_yaesu_cmd("PC", "025", 0.05)
+    radio_state['power'] = 25
+    log("默认功率: 25% (25W)")
     log(_t('log.com.init.ok', p=use_port, b=use_baud))
     return True
 
@@ -3280,7 +3351,7 @@ body::after {{
 <div class="card">
 <div class="title-container">
     <h1 class="main-title">FT-710 Remote Controller</h1>
-    <div class="subtitle">Yaesu FT-710</div>
+    <div class="subtitle">Designed by BI4IXO</div>
 </div>
 
 <div class="status-box">
@@ -3469,7 +3540,9 @@ body::after {{
     </div>
 </div>
 
-<div style="margin-top:14px; padding-top:10px; border-top:1px solid #333; font-size:11px; color:#555; text-align:center;">FT-710 Remote Controller</div>
+<div class="copyright">
+    Copyright &copy; 2026 BI4IXO. All rights reserved.
+</div>
 
 </div>
 
@@ -4464,6 +4537,8 @@ window.addEventListener('beforeunload', () => {{ if (socket) socket.disconnect()
 # ===================== GUI 主窗口 =====================
 class FT710ServerGUI:
     VERSION = "2.1"
+    EMAIL = "ruibaow@outlook.com"
+    QQ_GROUP = "232934024"
     
     C = {
         "bg":         "#dce8f5",
@@ -4490,7 +4565,7 @@ class FT710ServerGUI:
         except Exception:
             pass
         self.root = tk.Tk()
-        self.root.title(f"FT-710 Remote Controller  v{self.VERSION}")
+        self.root.title(f"FT-710 Remote Controller  v{self.VERSION}  Designed by BI4IXO")
         self.root.geometry("1000x680")
         self.root.minsize(700, 500)
         self.root.configure(bg=self.C["bg"])
@@ -5164,7 +5239,7 @@ class FT710ServerGUI:
 
     def _dialog_about(self):
         C = self.C
-        dlg = self._styled_dialog(_t('dlg.about.title'), 380, 180)
+        dlg = self._styled_dialog(_t('dlg.about.title'), 480, 320)
 
         card = tk.Frame(dlg, bg=C["glass"],
                         highlightbackground=C["border"], highlightthickness=1,
@@ -5173,13 +5248,22 @@ class FT710ServerGUI:
 
         tk.Label(card, text="FT-710 Remote Controller",
                  bg=C["glass"], fg=C["accent2"],
-                 font=("Microsoft YaHei", 13, "bold")).pack()
+                 font=("Microsoft YaHei", 15, "bold")).pack()
+        tk.Label(card, text="Designed by BI4IXO",
+                 bg=C["glass"], fg=C["text3"],
+                 font=("Microsoft YaHei", 10)).pack(pady=(2, 4))
         tk.Label(card, text=_t('lbl.about.ver', ver=self.VERSION),
                  bg=C["glass"], fg=C["text"],
-                 font=("Microsoft YaHei", 10)).pack(pady=(6,2))
+                 font=("Microsoft YaHei", 11)).pack(pady=(4, 2))
+        tk.Label(card, text=_t('lbl.about.email', e=self.EMAIL),
+                 bg=C["glass"], fg=C["text2"],
+                 font=("Microsoft YaHei", 11)).pack()
+        tk.Label(card, text=_t('lbl.about.qq', q=self.QQ_GROUP),
+                 bg=C["glass"], fg=C["text2"],
+                 font=("Microsoft YaHei", 11)).pack(pady=(2, 0))
         tk.Label(card, text=_t('lbl.about.log'),
                  bg=C["glass"], fg=C["text3"],
-                 font=("Microsoft YaHei", 9)).pack(pady=(6,0))
+                 font=("Microsoft YaHei", 10)).pack(pady=(8, 0))
 
         tk.Button(dlg, text=_t('btn.close'), command=dlg.destroy,
                   bg=C["glass2"], fg=C["text"],
