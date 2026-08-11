@@ -1,0 +1,42 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+venv311/
+*.pyd
+*.pyo
+
+# ===== 构建产物 (PyInstaller) =====
+build/
+dist/
+build.log
+
+# ===== 运行期生成 / 本机敏感文件 =====
+ft710_config.ini
+rig_config.ini
+config.ini
+cert.pem
+key.pem
+*.log
+*.localstorage
+devcaps.txt
+
+# ===== 大文件 / 压缩包 =====
+*.rar
+*.zip
+*.7z
+
+# ===== 第三方二进制 / 构建依赖 =====
+ffmpeg/
+libopus-0.dll
+rignet*
+
+ft710_controller - *.py
+ft710_controller-*.py
+ft710_controller_backup*.py
+code_2026*.py
+rignet_remote_controller.py
+m710_server.log*
+FT-710 Remote Controller v1.1 更新说明_v1.1.txt

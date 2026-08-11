@@ -1,0 +1,16 @@
+# FT-710 Remote Controller 依赖
+# 建议环境：64 位 Windows + Python 3.8（本项目打包基于 Python 3.8）
+# 安装：pip install -r requirements.txt
+
+aiortc
+av
+cryptography
+Flask
+Flask-SocketIO
+numpy
+opencv-python
+netifaces
+psutil
+pyserial
+scipy
+sounddevice
