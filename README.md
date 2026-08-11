@@ -4,10 +4,18 @@
 
 > WebRTC-based remote controller for the **Yaesu FT-710** HF transceiver. A local tkinter GUI runs as the server; any browser can control the radio remotely over HTTPS (audio / video / PTT / frequency).
 
+详细说明见 [DOCUMENTATION.md](DOCUMENTATION.md)（硬件接线、架构、配置、使用说明、API）。Full documentation: [DOCUMENTATION.md](DOCUMENTATION.md).
+
+## 截图 / Screenshots
+
+![GUI 主界面](docs/screenshots/gui_main.png)
+
+![Web UI 界面](docs/screenshots/webui_main.png)
+
 ## 特性 / Features
 
 - **本地图形界面**：tkinter，中/英双语（自动跟随系统语言）
-- **WebRTC 低延迟音频/视频**：网页端实时收发语音（Opus/PCMU），视频（MJPEG/VP8）
+- **WebRTC 低延迟音频/视频**：网页端实时收发语音（Opus/PCMU）；视频采集电台 **DVI 屏幕画面**（USB 采集卡）经 MJPEG/VP8 实时显示
 - **PTT 控制**：CAT 指令控制发射/接收，300ms 超时自动重发
 - **串口自适应**：自动枚举 COM 口、自动重连、波特率/电台地址可配置
 - **DSP 处理**：抗混叠低通抽取、VAD 语音门控、麦克风采样率自动对齐（16k/44.1k/48k）
@@ -22,6 +30,7 @@
 - Python **3.8**（也兼容 3.9–3.12，未经逐一验证）
 - 依赖见 `requirements.txt`
 - 视频功能需要 **ffmpeg**（随 exe 分发，或加入系统 PATH）
+- **硬件**：电台 USB 口→电脑（虚拟声卡，音频）、电台 DVI 输出→USB 采集卡→电脑（视频）、CAT 串口（控制）
 
 ## 安装运行 / Install & Run
 
@@ -73,6 +82,8 @@ pyinstaller --clean --noconfirm ft710.spec
 ft710_controller.py        # 主程序（GUI 服务端 + WebRTC + DSP + Flask/SocketIO）
 ft710.spec                 # PyInstaller 打包配置
 build.spec                 # 备用打包配置
+DOCUMENTATION.md           # 详细文档（硬件/架构/配置/使用）
+docs/screenshots/          # 界面截图
 ft710_config.example.ini   # 配置示例
 requirements.txt           # Python 依赖
 LICENSE                    # MIT
@@ -98,6 +109,11 @@ Copyright (c) 2026 [Robby Wang](https://github.com/ruibaow)
 
 **FT-710 Remote Controller** is a WebRTC-based remote controller for the Yaesu FT-710 HF transceiver. A tkinter GUI runs locally as the server; any browser on the LAN can operate the radio over HTTPS.
 
+### Screenshots
+![Main GUI](docs/screenshots/gui_main.png)
+
+![Web UI](docs/screenshots/webui_main.png)
+
 ### Features
 - Local tkinter GUI, bilingual (zh/en)
 - WebRTC low-latency audio (Opus/PCMU) and video (MJPEG/VP8)
@@ -111,6 +127,7 @@ Copyright (c) 2026 [Robby Wang](https://github.com/ruibaow)
 
 ### Requirements
 - 64-bit Windows, Python **3.8**+, ffmpeg (for video; bundled with the exe build)
+- **Hardware**: radio USB port → PC (virtual sound card, audio), radio DVI output → USB capture card → PC (video), CAT serial (control)
 
 ### Run
 ```bash
