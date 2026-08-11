@@ -142,11 +142,11 @@ https://<本机IP>:5000
 
 **主界面（tkinter GUI）**：
 
-![GUI 主界面](docs/screenshots/gui_main.png)
+![GUI 主界面](gui_main.png)
 
 **网页端界面（Web UI）**：
 
-![Web UI 界面](docs/screenshots/webui_main.png)
+![Web UI 界面](webui_main.png)
 
 ## 八、配置参考
 
@@ -377,11 +377,11 @@ First run auto-generates the config file and SSL certificate. Then open `https:/
 
 **Main GUI (tkinter)**:
 
-![Main GUI](docs/screenshots/gui_main.png)
+![Main GUI](gui_main.png)
 
 **Web UI**:
 
-![Web UI](docs/screenshots/webui_main.png)
+![Web UI](webui_main.png)
 
 ## 8. Configuration
 

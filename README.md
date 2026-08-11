@@ -8,9 +8,9 @@
 
 ## 截图 / Screenshots
 
-![GUI 主界面](docs/screenshots/gui_main.png)
+![GUI 主界面](gui_main.png)
 
-![Web UI 界面](docs/screenshots/webui_main.png)
+![Web UI 界面](webui_main.png)
 
 ## 特性 / Features
 
@@ -110,9 +110,9 @@ Copyright (c) 2026 [Robby Wang](https://github.com/ruibaow)
 **FT-710 Remote Controller** is a WebRTC-based remote controller for the Yaesu FT-710 HF transceiver. A tkinter GUI runs locally as the server; any browser on the LAN can operate the radio over HTTPS.
 
 ### Screenshots
-![Main GUI](docs/screenshots/gui_main.png)
+![Main GUI](gui_main.png)
 
-![Web UI](docs/screenshots/webui_main.png)
+![Web UI](webui_main.png)
 
 ### Features
 - Local tkinter GUI, bilingual (zh/en)
