@@ -19,6 +19,12 @@
 - **PTT 控制**：CAT 指令控制发射/接收，300ms 超时自动重发
 - **串口自适应**：自动枚举 COM 口、自动重连、波特率/电台地址可配置
 - **DSP 处理**：抗混叠低通抽取、VAD 语音门控、麦克风采样率自动对齐（16k/44.1k/48k）
+- **神经网络降噪（v2.2）**：DeepFilterNet3 离线推理，与 1-5 级谱减法互斥，弱语音保护可调（衰减上限 6~30dB）
+- **接收稳定性（v2.2.2）**：VAD 门限默认 -55dB（低电平声卡不再误关断）、支持按声卡名称精确选设备、接收增益 0.5x~5.0x
+- **设置页设备热刷新（v2.2.2）**：串口/音频/视频设置弹窗居中防溢出，一键刷新新接入设备无需重启
+- **现代化桌面主题（v2.2.2）**：Apple 风格配色 + 自绘圆角按钮，设置页更清爽
+- **横竖屏自适应（v2.2.2）**：横屏自动两列（左＝状态+增益/降噪/功率，右＝电台屏幕+频率/信道/PTT）
+- **iOS 音量补偿（v2.2.2）**：iOS 端 Web Audio 增益补偿，解决手机端音量偏小
 - **多客户端隔离**：每个 WebRTC 连接独立音频队列，慢客户端只丢自己的帧
 - **视频自愈**：假死看门狗（8 秒无帧自动重启 ffmpeg）、残留进程清理、快速失败退避
 - **空闲连接回收**：无数据流动 180 秒自动清理 WebRTC 连接，不留僵尸连接
@@ -26,8 +32,8 @@
 
 ## 环境要求 / Requirements
 
-- 64 位 Windows（打包验证环境）
-- Python **3.8**（也兼容 3.9–3.12，未经逐一验证）
+- 64 位 Windows **10 及以上**（v2.2.2 基于 Python **3.11** 打包）
+- Python **3.8~3.12**（源码运行，v2.2.2 依赖见 `requirements.txt`）
 - 依赖见 `requirements.txt`
 - 视频功能需要 **ffmpeg**（随 exe 分发，或加入系统 PATH）
 - **硬件**：电台 USB 口→电脑（虚拟声卡，音频）、电台 DVI 输出→USB 采集卡→电脑（视频）、CAT 串口（控制）
@@ -57,17 +63,18 @@ https://<本机IP>:5000
 | 配置节 | 说明 |
 | --- | --- |
 | `[SERIAL]` | COM 口、波特率 |
-| `[AUDIO]` | 采样率、块大小、输入/输出声卡设备号 |
+| `[AUDIO]` | 采样率、块大小、输入/输出声卡设备号；v2.2.2 起含 `RX_VAD_THRESHOLD_DB`（接收 VAD 门限，默认 -55）、`DEVICE_IN_NAME` / `DEVICE_OUT_NAME`（按名称精确选声卡）、`AI_ATTEN_LIM_DB`（降噪衰减上限）、`AI_INTRA_THREADS`（ORT 推理线程）、`GIL_SWITCH_INTERVAL_MS`（GIL 切换间隔，默认 0.5） |
+| `[SYSTEM]` | 进程优先级 `PROCESS_PRIORITY`（默认 above_normal） |
 | `[NETWORK]` | 服务端口（默认 5000） |
 | `[PTT]` | PTT 模式（momentary） |
-| `[VIDEO]` | 视频开关、摄像头索引、分辨率/帧率/质量 |
+| `[VIDEO]` | 视频开关、采集参数名、分辨率/帧率/质量 |
 | `[WEBRTC]` | WebRTC 音频/视频编码 |
 | `[CHANNELS]` | 快捷频率按钮（160m–10m） |
 | `[LANGUAGE]` | 界面语言 `zh` / `en` |
 
 ## 打包为 EXE / Build EXE
 
-使用 PyInstaller（本项目基于 **Python 3.8** + PyInstaller 5.13.2 构建）：
+使用 PyInstaller（v2.2.2 基于 **Python 3.11** + PyInstaller 6 构建；脚本会通过 `collect_all` 打入 onnxruntime / soxr / deepfilter_stream，并把 `dfn3_model/` 与 `ffmpeg/` 目录一并打包）：
 
 ```bash
 pip install pyinstaller
@@ -83,7 +90,8 @@ ft710_controller.py        # 主程序（GUI 服务端 + WebRTC + DSP + Flask/So
 ft710.spec                 # PyInstaller 打包配置
 build.spec                 # 备用打包配置
 DOCUMENTATION.md           # 详细文档（硬件/架构/配置/使用）
-docs/screenshots/          # 界面截图
+gui_main.png               # GUI 界面截图
+webui_main.png             # Web UI 界面截图（电台屏幕）
 ft710_config.example.ini   # 配置示例
 requirements.txt           # Python 依赖
 LICENSE                    # MIT

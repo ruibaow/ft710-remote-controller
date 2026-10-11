@@ -1,4 +1,4 @@
-# FT-710 Remote Controller v2.1
+# FT-710 Remote Controller v2.2.2
 # GUI Server - tkinter + Flask/SocketIO
 #
 # Copyright (c) 2026  Robby Wang
@@ -40,7 +40,7 @@ import sys
 import os
 import configparser
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, font as tkfont
 import threading as _gui_threading
 import threading as _threading
 import queue as _queue
@@ -49,6 +49,68 @@ import logging.handlers
 from datetime import datetime
 import collections
 from concurrent.futures import ThreadPoolExecutor
+
+# ===================== F1: GIL 切换间隔（可配置，默认 0.5ms） =====================
+# CPython 默认 5ms：其它线程占住 GIL 时，DSP 线程在每个 Python↔C 边界
+# （sosfilt/ONNX/soxr/numpy 共约 15~20 次/帧）最多要干等 5ms。缩短间隔能降 DSP 等待，
+# 但过小（如 0.5ms）会让本机多线程频繁上下文切换空转、反而拖慢整个软件（GUI 迟钝）。
+# v2.2.2 起由 [AUDIO] GIL_SWITCH_INTERVAL_MS 控制：默认 0.5ms（沿用 v2.2 实时调优，
+# 实测它在 DSP/WebRTC 音频下丢帧最少），0 = 用系统默认 5ms。
+def _apply_gil_switch_interval():
+    try:
+        ms = float(config['AUDIO'].get('GIL_SWITCH_INTERVAL_MS', '0.5'))
+        if ms > 0:
+            sys.setswitchinterval(ms / 1000.0)
+        else:
+            sys.setswitchinterval(0.005)
+    except Exception:
+        pass
+
+# ===================== H-a: 线程/进程优先级（进程恢复 ABOVE_NORMAL） =====================
+# 只调调度优先级，不改任何处理逻辑、不影响音质。
+# v2.2.2 起：整进程默认 ABOVE_NORMAL（0x8000，沿用 v2.2 实时调优），保留可配置项
+# [SYSTEM] PROCESS_PRIORITY（normal/above_normal/high，缺省 above_normal）。
+# 关键音频线程（DSP/TX写声卡）仍提权 THREAD_PRIORITY_HIGHEST(2)；视频线程取消提权，
+# 避免与 ffmpeg 子进程抢占、加剧卡顿。
+# 注意：x64 下必须显式声明 restype/argtypes——GetCurrentProcess 伪句柄(-1)
+# 默认按 c_int 处理会截断成无效句柄，调用静默失败。
+_PROCESS_PRIORITY_CLASS = {
+    'normal': 0x0020,
+    'above_normal': 0x8000,
+    'high': 0x0080,
+}
+
+def _set_process_priority_class(cls):
+    if sys.platform != 'win32' or not cls:
+        return False
+    try:
+        import ctypes
+        import ctypes.wintypes as _wt
+        _k = ctypes.windll.kernel32
+        _k.GetCurrentProcess.restype = _wt.HANDLE
+        _k.SetPriorityClass.argtypes = (_wt.HANDLE, _wt.DWORD)
+        _k.SetPriorityClass.restype = _wt.BOOL
+        return bool(_k.SetPriorityClass(_k.GetCurrentProcess(), cls))
+    except Exception:
+        return False
+
+def _boost_thread_priority():
+    if sys.platform != 'win32':
+        return False
+    try:
+        import ctypes
+        import ctypes.wintypes as _wt
+        _k = ctypes.windll.kernel32
+        _k.GetCurrentThread.restype = _wt.HANDLE
+        _k.SetThreadPriority.argtypes = (_wt.HANDLE, ctypes.c_int)
+        _k.SetThreadPriority.restype = _wt.BOOL
+        return bool(_k.SetThreadPriority(_k.GetCurrentThread(), 2))
+    except Exception:
+        return False
+
+def _apply_process_priority():
+    _set_process_priority_class(_PROCESS_PRIORITY_CLASS.get(
+        str(config['SYSTEM'].get('PROCESS_PRIORITY', 'above_normal')).lower(), 0x8000))
 
 # 视频捕获（可选）
 try:
@@ -90,9 +152,12 @@ CONFIG_FILE = os.path.join(_config_dir, "ft710_config.ini")
 LOG_FILE    = os.path.join(_config_dir, "ft710_server.log")
 APP_DIR = _exe_dir
 
+# PyInstaller 6 的 onedir 布局把随包资源放在 <exe>\_internal\ 下
+_RSC_DIR = os.path.join(_exe_dir, '_internal') if os.path.isdir(os.path.join(_exe_dir, '_internal')) else _exe_dir
+
 # ===================== 日志系统 =====================
 import queue as _gui_log_q
-_gui_log_queue = _gui_log_q.Queue()
+_gui_log_queue = _gui_log_q.Queue(maxsize=5000)
 
 def _setup_logger():
     logger = logging.getLogger("ft710")
@@ -148,7 +213,15 @@ def log(msg):
     try:
         _gui_log_queue.put_nowait(msg)
     except Exception:
-        pass
+        # 队列满：丢最旧一条，保证 GUI 日志始终保留最新内容
+        try:
+            _gui_log_queue.get_nowait()
+        except Exception:
+            pass
+        try:
+            _gui_log_queue.put_nowait(msg)
+        except Exception:
+            pass
 
 # ===================== 默认配置 =====================
 DEFAULT_CONFIG = {
@@ -164,7 +237,16 @@ DEFAULT_CONFIG = {
         'CHANNELS': 1,
         'BLOCK_SIZE': 512,
         'DEVICE_IN': '-1',
-        'DEVICE_OUT': '-1'
+        'DEVICE_OUT': '-1',
+        'DEVICE_IN_NAME': '',
+        'DEVICE_OUT_NAME': '',
+        'RX_VAD_THRESHOLD_DB': '-55',
+        'AI_ATTEN_LIM_DB': '12',
+        'AI_INTRA_THREADS': '1',
+        'GIL_SWITCH_INTERVAL_MS': '0.5'
+    },
+    'SYSTEM': {
+        'PROCESS_PRIORITY': 'above_normal'
     },
     'NETWORK': {
         'PORT': 5000
@@ -175,10 +257,11 @@ DEFAULT_CONFIG = {
     'VIDEO': {
         'ENABLED': 'false',
         'DEVICE_INDEX': '0',
-        'WIDTH': '320',
-        'HEIGHT': '240',
+        'DEVICE_NAME': 'USB Video',
+        'WIDTH': '640',
+        'HEIGHT': '480',
         'FPS': '15',
-        'QUALITY': '15'
+        'QUALITY': '3'
     },
     'CHANNELS': {
         'ch_160m_1': '1.840,LSB,',
@@ -220,11 +303,31 @@ def load_config():
     
     return config
 
+_config_save_lock = _threading.Lock()
+
 def save_config(config):
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        config.write(f)
+    # 原子写：临时文件 + fsync + os.replace，消除并发写与写一半崩溃导致的 ini 截损
+    with _config_save_lock:
+        tmp = CONFIG_FILE + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                config.write(f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CONFIG_FILE)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            raise
 
 config = load_config()
+
+# ===================== 运行时调优（读取配置后生效） =====================
+_apply_process_priority()
+_apply_gil_switch_interval()
 
 # ===================== 中英文文案表（I18N） =====================
 LANG = config['LANGUAGE'].get('CODE', 'zh').lower()
@@ -301,6 +404,7 @@ I18N = {
     'log.init':           {'zh': '正在初始化 FT-710 控制程序...', 'en': 'Initializing FT-710 controller...'},
     'log.start.video':    {'zh': '正在启动视频流...', 'en': 'Starting video stream...'},
     'log.video.ok':       {'zh': '视频流已自动启动', 'en': 'Video stream auto-started'},
+    'log.video.circuit':  {'zh': '视频设备连续多次无法打开，已暂停自动重试。请检查摄像头电源/USB连接（或是否被其它程序占用），然后在界面重新开启视频', 'en': 'Video device repeatedly failed to open; auto-retry paused. Check camera power/USB (or whether it is in use), then re-enable video'},
     'log.access':         {'zh': '访问地址：{u}',   'en': 'Access URL: {u}'},
     'log.serial':         {'zh': '串口：{p} @ {b}', 'en': 'Serial: {p} @ {b}'},
     'log.audio.link':     {'zh': '音频：{r}Hz → 16kHz DSP', 'en': 'Audio: {r}Hz → 16kHz DSP'},
@@ -328,6 +432,12 @@ I18N = {
     'log.lang.switch':    {'zh': '界面语言已切换为 中文', 'en': 'Language switched to English'},
     'log.port.refresh':   {'zh': '刷新串口列表：{l}', 'en': 'Refreshed port list: {l}'},
     'log.port.refresh.fail': {'zh': '串口列表刷新失败：{e}', 'en': 'Port list refresh failed: {e}'},
+    'log.audio.refresh':  {'zh': '音频设备已刷新：输入={a} 输出={b}', 'en': 'Audio devices refreshed: IN={a} OUT={b}'},
+    'log.audio.refresh.fail': {'zh': '音频设备刷新失败：{e}', 'en': 'Audio device refresh failed: {e}'},
+    'log.video.refresh':  {'zh': '视频设备已刷新：{l}', 'en': 'Video devices refreshed: {l}'},
+    'btn.refresh':        {'zh': '刷新设备',         'en': 'Refresh Devices'},
+    'btn.refresh.short':  {'zh': '刷新',             'en': 'Refresh'},
+    'lbl.refresh.hint':   {'zh': '新插入的声卡/摄像头无需重启程序，点此刷新即可显示', 'en': 'Newly plugged-in devices appear after refresh'},
     'log.port.ok':        {'zh': '✅ 串口 {p}@{b} 成功', 'en': '✅ Serial {p}@{b} ok'},
     'log.port.fail':      {'zh': '❌ 串口 {p}@{b} 失败', 'en': '❌ Serial {p}@{b} failed'},
     'log.com.init.fail':  {'zh': '串口初始化失败：{e}', 'en': 'Serial init failed: {e}'},
@@ -377,9 +487,15 @@ I18N = {
     'ws.btn.ptt':         {'zh': 'PTT 按住说话',     'en': 'PTT Hold to Talk'},
     'ws.btn.act':         {'zh': '🎧 激活音频',      'en': '🎧 Activate Audio'},
     'ws.btn.restart':     {'zh': '🔄 重启音频',      'en': '🔄 Restart Audio'},
-    'ws.gain.rx':         {'zh': '🔊 接收增益（5级，0.5x~2.5x）', 'en': '🔊 RX Gain (5 levels, 0.5x~2.5x)'},
+    'ws.gain.rx':         {'zh': '🔊 接收增益',       'en': '🔊 RX Gain'},
     'ws.gain.mic':        {'zh': '🎙️ 麦克风增益',   'en': '🎙️ Mic Gain'},
     'ws.noise':           {'zh': '🔇 DSP降噪',       'en': '🔇 DSP NR'},
+    'ws.ai.title':        {'zh': '✨ 神经网络降噪',  'en': '✨ AI Denoise'},
+    'ws.ai.on':           {'zh': '开启',             'en': 'On'},
+    'ws.ai.off':          {'zh': '关闭',             'en': 'Off'},
+    'ws.ai.hint':         {'zh': 'DFN3 · 开启后谱减法暂停', 'en': 'DFN3 · spectral NR paused'},
+    'ws.ai.atten':        {'zh': '降噪强度',         'en': 'Strength'},
+    'ws.ai.circuit':      {'zh': '已熔断，冷却后可重试', 'en': 'Circuit open, retry later'},
     'ws.tuner.title':     {'zh': '📡 天线调谐器',    'en': '📡 Antenna Tuner'},
     'ws.tuner.toggle':    {'zh': '开关',             'en': 'On / Off'},
     'ws.tuner.start':     {'zh': '🔄 调谐',          'en': '🔄 Tune'},
@@ -406,6 +522,7 @@ I18N = {
     'js.video.streaming': {'zh': '视频传输中',       'en': 'Streaming video'},
     'js.video.failed':    {'zh': '视频播放失败',     'en': 'Video playback failed'},
     'js.video.wait':      {'zh': '等待视频轨道...',  'en': 'Waiting for video track...'},
+    'js.video.stopped':   {'zh': '视频设备不可用，已停止。请检查摄像头电源/USB连接后重新开启', 'en': 'Video device unavailable; stopped. Check camera power/USB, then re-enable'},
     'js.alert.activate_first': {'zh': '请先激活音频！', 'en': 'Please activate audio first!'},
     'js.alert.activate_full':  {'zh': '音频激活失败：{}\n1. 检查麦克风权限\n2. 使用Chrome/Edge\n3. 关闭其他占用麦克风的程序', 'en': 'Audio activation failed: {}\n1. Check microphone permission\n2. Use Chrome/Edge\n3. Close other apps using the mic'},
     'js.alert.freq1':     {'zh': '请输入有效的频率！', 'en': 'Please enter a valid frequency!'},
@@ -445,8 +562,8 @@ SERVER_PORT = int(config['NETWORK']['PORT'])
 PTT_MODE = config['PTT'].get('MODE', 'momentary').lower()
 
 # ===================== 音频参数配置 =====================
-GAIN_LEVELS = [0.5, 1.0, 1.5, 2.0, 2.5]
-current_gain_level = 1
+GAIN_LEVELS = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.25, 4.5, 4.75, 5.0]
+current_gain_level = 2
 
 MIC_GAIN_LEVELS = [1.0, 1.25, 1.5, 1.75, 2.0]
 current_mic_gain_level = 4
@@ -546,6 +663,15 @@ tx_active = Event()
 tx_active.clear()
 tx_start_time = 0.0
 
+# PTT 持有者：持有发射的 SocketIO 客户端 sid，断线时自动回收发射
+_ptt_owner_sid = None
+# 麦克风丢帧计数（无可追溯的静默丢弃）
+_mic_skip_count = 0
+# 客户端播放链路诊断：kind -> 上次记录时间(monotonic)，60s 节流 + TTL/上限防内存 DoS
+_client_diag_last = {}
+_CLIENT_DIAG_TTL = 3600.0
+_CLIENT_DIAG_MAX = 128
+
 _running = Event()
 
 _VAD_THRESHOLD_DB = -45.0
@@ -568,7 +694,224 @@ _rx_sos = make_sos(250, 4000, SAMPLING_RATE)
 from scipy.signal import sosfilt_zi as _sosfilt_zi
 _rx_zi = _sosfilt_zi(_rx_sos) * 0.0
 
+# ===================== DeepFilterNet3 AI 降噪 =====================
+# 与 1-5 级谱减法互斥：AI 开启时 DSP 走 DFN3（48k），否则保持原谱减法（16k）
+_DFN_MODEL_DIR = os.path.join(_RSC_DIR, 'dfn3_model')
+try:
+    import deepfilter_stream as _dfs
+    import deepfilter_stream.resample as _dfs_rs
+    _DFN_AVAILABLE = True
+except Exception:
+    _dfs = None
+    _dfs_rs = None
+    _DFN_AVAILABLE = False
+
+def _patch_soxr_quality(default="HQ"):
+    """16k↔48k soxr 重采样质量 VHQ→HQ，省约0.1~0.3ms/块（幂等）。"""
+    if not _DFN_AVAILABLE:
+        return False
+    if getattr(_dfs_rs.StreamResampler.__init__, "_ft710_hq_patched", False):
+        return True
+    try:
+        _orig_init = _dfs_rs.StreamResampler.__init__
+        def _init_hq(self, in_rate, out_rate, quality=default):
+            _orig_init(self, in_rate, out_rate, quality=quality)
+        _init_hq._ft710_hq_patched = True
+        _dfs_rs.StreamResampler.__init__ = _init_hq
+        return True
+    except Exception:
+        return False
+
+def _patch_dfn_hot_path():
+    """DFN3 每块热路径减拷贝/减分配（monkeypatch，幂等，仅改数据搬运不改算法）。"""
+    if not _DFN_AVAILABLE:
+        return False
+    try:
+        from deepfilter_stream import denoiser as _dfd
+        if getattr(_dfd.Denoiser, "_ft710_hot_patched", False):
+            return True
+
+        def _process_frame(self, frame):
+            frame = frame.reshape(-1)
+            feeds = {"input_frame": frame}
+            feeds.update(self._states)
+            res = self._model.session.run(self._model.output_names, feeds)
+            enhanced = res[0].reshape(-1)
+            for name, val in zip(self._model.input_names[1:], res[1:]):
+                self._states[name] = val
+            if self.atten_lim_db is not None:
+                self._dry_delay.write(frame)
+                dry = self._dry_delay.pop(self.frame_size)
+                dry *= self._lim
+                enhanced *= (1.0 - self._lim)
+                enhanced += dry
+            return enhanced
+
+        def _process(self, samples, sr):
+            self._guard()
+            try:
+                x = np.ascontiguousarray(samples, dtype=np.float32)
+                if x.ndim == 2:
+                    x = x.mean(axis=1) if x.shape[1] <= x.shape[0] else x.mean(axis=0)
+                x = x.reshape(-1)
+                self._ensure_resamplers(sr)
+                if self._in_rs is not None:
+                    x = self._in_rs.process(x)
+                self._in_buf.write(x)
+                f = self.frame_size
+                out_frames = []
+                while self._in_buf.available >= f:
+                    out_frames.append(self.process_frame(self._in_buf.pop(f)))
+                if not out_frames:
+                    y = np.zeros(0, dtype=np.float32)
+                elif len(out_frames) == 1:
+                    y = out_frames[0]
+                else:
+                    y = np.concatenate(out_frames)
+                if self._out_rs is not None:
+                    y = self._out_rs.process(y)
+                return y
+            finally:
+                self._lock.release()
+
+        _dfd.Denoiser.process_frame = _process_frame
+        _dfd.Denoiser.process = _process
+        _dfd.Denoiser._ft710_hot_patched = True
+        return True
+    except Exception:
+        return False
+
+_patched_soxr = _patch_soxr_quality()
+_patched_dfn_hot = _patch_dfn_hot_path()
+
+_ai_denoise_enabled = False   # 神经网络降噪开关（set_ai_denoise 控制）
+_ai_model = None              # 共享 DeepFilterModel（懒加载）
+_ai_stream = None             # Denoiser 流对象（仅 _dsp_worker 线程调用 process）
+_ai_load_error = None         # 最近一次加载失败原因
+_ai_tx_reset_done = True      # TX静默期内是否已重置流状态
+_ai_atten_lim_db = float(config['AUDIO'].get('AI_ATTEN_LIM_DB', '12'))  # 衰减上限dB（6-30）
+_ai_params_pending = False    # 参数热应用标志
+_ai_intra_threads = int(config['AUDIO'].get('AI_INTRA_THREADS', '1'))   # ORT intra-op 线程数
+_ai_load_lock = _threading.Lock()
+_ai_loading = False
+_ai_enable_want = False
+_ai_fail_count = 0
+_ai_circuit_open = False
+_ai_circuit_until = 0.0
+_AI_FAIL_LIMIT = 3
+_AI_CIRCUIT_COOLDOWN = 60.0
+
+
+class _TunedDFNModel(_dfs.DeepFilterModel if _DFN_AVAILABLE else object):
+    """调优版 DeepFilterModel：限制线程数 + 自旋，降低 CPU 占用（仅覆盖 __init__）。"""
+
+    def __init__(self, intra_op_num_threads: int = 2) -> None:
+        if not _DFN_AVAILABLE:
+            raise RuntimeError("deepfilter-stream 未安装")
+        from deepfilter_stream import assets as _df_assets
+        from deepfilter_stream import _meta as _df_meta
+        import onnxruntime as ort
+        paths = _df_assets.ensure_assets()
+
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = int(intra_op_num_threads)
+        so.inter_op_num_threads = 1
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.add_session_config_entry("session.intra_op.allow_spinning", "1")
+        self.session = ort.InferenceSession(
+            str(paths["onnx"]), sess_options=so, providers=["CPUExecutionProvider"]
+        )
+        self.input_names = [i.name for i in self.session.get_inputs()]
+        self.output_names = [o.name for o in self.session.get_outputs()]
+        self.frame_size = int(self.session.get_inputs()[0].shape[0])
+        self.sample_rate = _df_meta.SAMPLE_RATE
+        with np.load(paths["initial_states"]) as z:
+            self._init = {name: z[name].astype(np.float32) for name in self.input_names[1:]}
+
+
+def _ai_warmup(stream, n=30):
+    """新流预热（best-effort）：ORT 内存 arena/算子选择前几次 run 才懒初始化。"""
+    try:
+        zeros = np.zeros(512, dtype=np.float32)
+        for _ in range(int(n)):
+            stream.process(zeros, SAMPLING_RATE)
+        log(f"DFN3 已预热{n}帧（推理+重采样冷启动完成）")
+        return True
+    except Exception as e:
+        log(f"DFN3 预热跳过（不影响使用）：{e!r}")
+        return False
+    finally:
+        try:
+            stream.reset()
+        except Exception:
+            pass
+
+
+def _ai_ensure_loaded():
+    """懒加载 DFN3 模型与流对象。成功返回 True，失败记录原因并返回 False。"""
+    global _ai_model, _ai_stream, _ai_load_error
+    if not _DFN_AVAILABLE:
+        _ai_load_error = "deepfilter-stream 未安装"
+        return False
+    try:
+        if _ai_model is None:
+            if os.path.isdir(_DFN_MODEL_DIR):
+                os.environ['DEEPFILTER_STREAM_MODEL_DIR'] = _DFN_MODEL_DIR
+            _ai_model = _TunedDFNModel(intra_op_num_threads=_ai_intra_threads)
+            log(f"DFN3 模型已加载：{_DFN_MODEL_DIR if os.path.isdir(_DFN_MODEL_DIR) else '缓存目录'}"
+                f"（ORT线程={_ai_intra_threads} 自旋=开）")
+        if _ai_stream is None:
+            _st = _ai_model.new_stream(atten_lim_db=_ai_atten_lim_db)
+            _ai_warmup(_st)
+            _ai_stream = _st
+        _ai_load_error = None
+        return True
+    except Exception as e:
+        _ai_load_error = str(e)
+        return False
+
+
+def _ai_load_worker():
+    """后台加载 DFN3（ONNX 会话创建可达数秒，不能占用 SocketIO 事件线程）。"""
+    global _ai_denoise_enabled, _ai_loading, _ai_fail_count, _ai_circuit_open
+    global _ai_enable_want, _ai_circuit_until, _ai_load_error
+    try:
+        ok = _ai_ensure_loaded()
+    except Exception as e:
+        _ai_load_error = str(e)
+        ok = False
+    with _ai_load_lock:
+        _ai_loading = False
+        if not ok:
+            _ai_fail_count += 1
+            if _ai_fail_count >= _AI_FAIL_LIMIT:
+                _ai_circuit_open = True
+                _ai_circuit_until = time.monotonic() + _AI_CIRCUIT_COOLDOWN
+            _ai_denoise_enabled = False
+            _ai_enable_want = False
+        elif _ai_enable_want:
+            _ai_fail_count = 0
+            _ai_denoise_enabled = True
+        else:
+            _ai_denoise_enabled = False
+        radio_state["ai_denoise"] = _ai_denoise_enabled
+        state_err = None if ok else _ai_load_error
+        tripped = _ai_circuit_open and not ok
+    if ok and _ai_denoise_enabled:
+        log("神经网络降噪已开启（DFN3 后台加载完成，谱减法暂停）")
+        socketio.emit('ai_denoise_updated', {'enabled': True}, namespace='/')
+    elif not ok:
+        msg = f"连续失败{_ai_fail_count}次已熔断，稍后可重试" if tripped else f"加载失败（第{_ai_fail_count}次）"
+        log(f"神经网络降噪{msg}：{state_err}")
+        socketio.emit('ai_denoise_updated', {'enabled': False, 'error': state_err,
+                                             'circuit_open': tripped}, namespace='/')
+    else:
+        log("神经网络降噪加载中被关闭，保持关闭状态")
+        socketio.emit('ai_denoise_updated', {'enabled': False}, namespace='/')
+
 # ===================== 降噪状态 =====================
+# 保护 _noise_profile：DSP 线程逐帧读写，音频重启/换模式线程会整体清零，需互斥
+_noise_profile_lock = _threading.Lock()
 _noise_profile = {
     "spectrum": None,
     "history": [],
@@ -604,12 +947,15 @@ _TARGET_RATE = 16000  # 下采样目标
 _stream_lock = _threading.Lock()
 _rx_start_seq = 0
 
-_RING_SIZE = max(4, int(0.5 * SAMPLING_RATE / AUDIO_BLOCK_SIZE))
+_RING_SIZE = max(4, int(2.0 * SAMPLING_RATE / AUDIO_BLOCK_SIZE))
+log(f"运行时调优: GIL切换间隔={sys.getswitchinterval()*1000:.2f}ms RING={_RING_SIZE}帧({_RING_SIZE*AUDIO_BLOCK_SIZE/SAMPLING_RATE:.2f}s)")
 _ring_buf = np.zeros((_RING_SIZE, AUDIO_BLOCK_SIZE), dtype='float32')
 _ring_write = 0
 _ring_read  = 0
 _ring_lock  = _threading.Lock()
 _ring_event = _threading.Event()
+_ring_overflow_count = 0
+_ring_last_overflow_log = 0.0
 
 _webrtc_audio_accum = np.zeros((0,), dtype='float32')
 _tx_squelch_until  = 0.0
@@ -646,6 +992,7 @@ _tx_audio_frame_count = 0
 
 def _tx_audio_worker():
     global _tx_audio_frame_count
+    _boost_thread_priority()
     while not _running.is_set():
         try:
             audio_frame = _tx_audio_queue.get(timeout=0.5)
@@ -688,8 +1035,19 @@ def _reset_ring_buffer():
     with _ring_lock:
         _ring_read = _ring_write
 
+_rms_work = None
+def _frame_rms(audio):
+    """返回帧能量 RMS（float）。复用 _rms_work 缓冲按需重分配，无每帧临时数组。"""
+    global _rms_work
+    if (_rms_work is None or _rms_work.shape != audio.shape
+            or _rms_work.dtype != audio.dtype):
+        _rms_work = np.empty(audio.shape, dtype=audio.dtype)
+    np.multiply(audio, audio, out=_rms_work)
+    return float(np.sqrt(np.mean(_rms_work)))
+
 def _check_vad(audio, vad_hang):
-    rms = float(np.sqrt(np.mean(audio ** 2)))
+    """轻量级能级检测 VAD。返回 (新hang, 是否语音, rms)——rms 由调用方复用。"""
+    rms = _frame_rms(audio)
     db = 20 * np.log10(rms + 1e-10)
     if db > _VAD_THRESHOLD_DB:
         return _VAD_HANG_FRAMES, True, rms
@@ -698,10 +1056,73 @@ def _check_vad(audio, vad_hang):
     else:
         return 0, False, rms
 
+
+# ===================== F2: DSP 分段耗时观测 =====================
+# 在真机上量出每帧：sosfilt / 门控 / 降噪(DFN3) / 编码 各占多少，
+# 以及「胶水+GIL等待」= 总耗时 - 四段之和。每 _PERF_EVERY 个完整帧聚合打印一行，
+# 绝不逐帧刷日志——观测太吵会反过来加重 GIL 争抢、污染测量结果。
+_pc = time.perf_counter
+_PERF_EVERY = 200
+_perf = {
+    "n": 0, "n_skip": 0, "pend_max": 0, "pend_sum": 0.0,
+    "sos": 0.0, "vad": 0.0, "ai": 0.0, "enc": 0.0, "total": 0.0,
+}
+
+def _perf_skip():
+    """被 VAD/RMS 门控跳过的帧：只计数，不计入耗时均值（否则拉低均值、掩盖真实开销）"""
+    _perf["n_skip"] += 1
+    if _perf["n"] == 0 and _perf["n_skip"] >= _PERF_EVERY:
+        log(f"DSP分段：连续{_PERF_EVERY}帧全被门控跳过，无完整帧可统计")
+        _perf["n_skip"] = 0
+
+def _perf_add(t_sos, t_vad, t_ai, t_enc, t_total, pending):
+    """累积一个完整帧的分段耗时；满 _PERF_EVERY 帧打印一行汇总"""
+    _perf["n"] += 1
+    _perf["sos"] += t_sos
+    _perf["vad"] += t_vad
+    _perf["ai"] += t_ai
+    _perf["enc"] += t_enc
+    _perf["total"] += t_total
+    _perf["pend_sum"] += pending
+    if pending > _perf["pend_max"]:
+        _perf["pend_max"] = pending
+    if _perf["n"] < _PERF_EVERY:
+        return
+    n = _perf["n"]
+    def ms(k):
+        return _perf[k] / n * 1000.0
+    wait = ms("total") - ms("sos") - ms("vad") - ms("ai") - ms("enc")
+    if wait < 0.0:
+        wait = 0.0
+    log(f"DSP分段({n}帧): "
+        f"总{ms('total'):.1f}ms | "
+        f"sos{ms('sos'):.2f} 门控{ms('vad'):.2f} 降噪{ms('ai'):.1f} 编码{ms('enc'):.2f} | "
+        f"胶水+GIL等待{wait:.1f} | "
+        f"ring积压 max{_perf['pend_max']}/avg{_perf['pend_sum'] / n:.1f}"
+        f"(满{_RING_SIZE - 1}) | 门控跳过{_perf['n_skip']}")
+    _perf["n"] = _perf["n_skip"] = _perf["pend_max"] = 0
+    _perf["sos"] = _perf["vad"] = _perf["ai"] = _perf["enc"] = 0.0
+    _perf["total"] = _perf["pend_sum"] = 0.0
+
 def _dsp_worker():
     global _ring_read, _downsampler, _rx_sos, _rx_zi, SAMPLING_RATE, _webrtc_audio_accum
-    global _dsp_error_count
+    global _dsp_error_count, _ai_tx_reset_done, _ai_params_pending, _VAD_THRESHOLD_DB
 
+    _boost_thread_priority()
+    # RX 广播 VAD 门限可配置：默认 -55dB。设备输入电平偏低/弱信号时调低（如 -60），
+    # 否则低于门限的电台音频会被当静音丢弃，表现为接收无声/偶尔冒一声。
+    try:
+        _VAD_THRESHOLD_DB = float(config['AUDIO'].get('RX_VAD_THRESHOLD_DB', '-55'))
+        log(f"RX VAD 门限：{_VAD_THRESHOLD_DB:.1f} dB")
+    except Exception:
+        pass
+    # 两个 RMS 门控跟随 VAD 门限（分别低 3dB / 6dB），保证弱信号不被二次卡掉
+    try:
+        _vad_rms = 10 ** (_VAD_THRESHOLD_DB / 20.0)
+    except Exception:
+        _vad_rms = 10 ** (-55.0 / 20.0)
+    _rx_gate1 = _vad_rms * (10 ** (-3.0 / 20.0))
+    _rx_gate2 = _vad_rms * (10 ** (-6.0 / 20.0))
     vad_hang = 0
     _dsp_skip_tx = 0
     _dsp_skip_vad = 0
@@ -722,63 +1143,114 @@ def _dsp_worker():
 
             if tx_active.is_set() or time.monotonic() < _tx_squelch_until:
                 _dsp_skip_tx += 1
+                _perf_skip()
                 _drain_send_queue()
+                # TX期间输入不连续：重置 DFN3 流状态，避免 RX 恢复时输出残留
+                if _ai_stream is not None and not _ai_tx_reset_done:
+                    try:
+                        _ai_stream.reset()
+                    except Exception:
+                        pass
+                    _ai_tx_reset_done = True
                 continue
 
             try:
+                t_blk0 = _pc()
                 with noise_lock:
                     noise_level = current_noise_level
                 with gain_lock:
                     gain_value  = GAIN_LEVELS[current_gain_level]
 
-                # 下采样：48kHz -> 16kHz
+                # ① AI 神经网络降噪（DFN3，48k 输入）——与谱减法互斥
+                t0 = _pc()
+                ai_active = _ai_denoise_enabled and _ai_stream is not None
+                if ai_active:
+                    if _ai_params_pending:
+                        _ai_params_pending = False
+                        try:
+                            _ai_stream.atten_lim_db = _ai_atten_lim_db
+                            _ai_stream._lim = float(10.0 ** (-_ai_atten_lim_db / 20.0))
+                        except Exception:
+                            pass
+                    try:
+                        out48 = _ai_stream.process(audio, SAMPLING_RATE)
+                    except Exception as _e:
+                        log(f"DFN3 处理异常：{_e!r}")
+                        out48 = audio
+                    _ai_tx_reset_done = False
+                    if out48 is None or len(out48) == 0:
+                        t_ai = _pc() - t0
+                        _perf_skip()
+                        continue
+                    audio = np.ascontiguousarray(out48, dtype=np.float32)
+                t_ai = _pc() - t0
+
+                # ② 下采样：48kHz -> 16kHz
                 if _downsampler is not None:
                     audio = _downsampler.process(audio)
                     if audio is None:
+                        _perf_skip()
                         continue
 
-                # 带通滤波（持续状态，消除帧边界不连续）
+                # ③ 带通滤波（持续状态，消除帧边界不连续）
+                t0 = _pc()
                 with _dsp_state_lock:
                     audio, _rx_zi = sosfilt(_rx_sos, audio, zi=_rx_zi)
                 audio = audio.astype('float32')
+                t_sos = _pc() - t0
 
-                # VAD 检测：静音期直接丢弃（rms 复用，避免重复计算）
+                # ④ VAD 检测：静音期直接丢弃（rms 复用，避免重复计算）
+                t0 = _pc()
                 vad_hang, is_speech, frame_rms = _check_vad(audio, vad_hang)
                 if not is_speech:
                     _dsp_skip_vad += 1
+                    _perf_skip()
                     continue
 
                 # 增益前 RMS 门控
-                if frame_rms < 0.004:
+                if frame_rms < _rx_gate1:
                     _dsp_skip_rms += 1
+                    _perf_skip()
                     continue
+                t_vad = _pc() - t0
 
-                if nb_enabled:
-                    audio = apply_noise_blanker(audio)
+                # ⑤ 降噪：AI 已在上游处理，此处仅跑谱减法（互斥）
+                if not ai_active:
+                    t0 = _pc()
+                    if nb_enabled:
+                        audio = apply_noise_blanker(audio)
 
-                if noise_level > 0:
-                    audio = apply_noise_reduction(audio, noise_level)
+                    if noise_level > 0:
+                        audio = apply_noise_reduction(audio, noise_level)
+                    t_ai += _pc() - t0
 
                 if gain_value != 1.0:
                     audio = audio * gain_value
 
                 audio = np.clip(audio, -0.95, 0.95).astype('float32')
 
-                # 降噪后二次 RMS 检查
-                if float(np.sqrt(np.mean(audio ** 2))) < 0.002:
+                # ⑥ 降噪后二次 RMS 检查（复用工作缓冲原地计算，不新建临时数组）
+                if _frame_rms(audio) < _rx_gate2:
+                    _perf_skip()
                     continue
 
-                # WebRTC 音频路径：累积到160-sample帧（10ms @ 16kHz）
+                # ⑦ WebRTC 音频路径：累积到160-sample帧（10ms @ 16kHz）
+                t0 = _pc()
                 _webrtc_audio_accum = np.concatenate([_webrtc_audio_accum, audio])
                 while len(_webrtc_audio_accum) >= 160:
                     chunk_f32 = _webrtc_audio_accum[:160]
                     _webrtc_audio_accum = _webrtc_audio_accum[160:]
                     chunk_payload = b'\x01' + chunk_f32.tobytes()
                     _webrtc_audio_broadcast(chunk_payload)
+                t_enc = _pc() - t0
+
                 _dsp_processed += 1
                 _dsp_error_count = 0  # 成功处理即清零：瞬时错误不再累积到致命阈值
+                _perf_add(t_sos, t_vad, t_ai, t_enc, _pc() - t_blk0, pending)
             except Exception as e:
                 _dsp_error_count += 1
+                if _dsp_error_count % 10 == 1:
+                    log(f"DSP线程异常（累计{_dsp_error_count}）: {e!r}")
                 if _dsp_error_count >= _MAX_ERRORS:
                     log(f"DSP线程异常次数过多（{_dsp_error_count}），即将退出重启")
                     return
@@ -792,27 +1264,31 @@ def _dsp_worker():
 _dsp_thread  = _threading.Thread(target=_dsp_worker,  daemon=True, name='AudioDSP')
 _dsp_thread.start()
 
-def _dsp_supervisor():
-    """DSP线程守护：异常退出后自动重启，确保RX音频永不静默死亡"""
-    global _dsp_thread, _dsp_error_count
+def _monitor_threads():
+    """线程健康监控：DSP / TX写声卡 异常退出后自动重启，确保音频链路永不静默死亡"""
+    global _dsp_thread, _dsp_error_count, _tx_audio_thread
     while not _running.is_set():
-        time.sleep(5)
+        time.sleep(3)
         try:
             if not _dsp_thread.is_alive():
                 _dsp_error_count = 0
                 log("DSP线程已退出，自动重启")
                 _dsp_thread = _threading.Thread(target=_dsp_worker, daemon=True, name='AudioDSP')
                 _dsp_thread.start()
+            if not _tx_audio_thread.is_alive() and not _running.is_set():
+                log("TX写声卡线程已退出，自动重启")
+                _tx_audio_thread = _threading.Thread(target=_tx_audio_worker, daemon=True, name='TxAudio')
+                _tx_audio_thread.start()
         except Exception:
             pass
 
-_threading.Thread(target=_dsp_supervisor, daemon=True, name='AudioDSPSupervisor').start()
+_threading.Thread(target=_monitor_threads, daemon=True, name='ThreadMonitor').start()
 
 # ===================== Flask初始化 =====================
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'ft710-audio'
 
-def get_all_network_ips():
+def _enumerate_network_ips():
     """枚举本机所有非回环 IPv4 地址"""
     try:
         try:
@@ -850,11 +1326,27 @@ def get_all_network_ips():
         pass
     return [socket.gethostbyname(socket.gethostname())]
 
-_all_ips = get_all_network_ips()
+_IPS_TTL = 30.0
+_ips_cache = None
+_ips_cache_ts = 0.0
+
+def get_all_network_ips(force=False):
+    """枚举本机所有非回环 IPv4 地址（30s TTL 缓存，避免每请求遍历网卡）"""
+    global _ips_cache, _ips_cache_ts
+    now = time.time()
+    if not force and _ips_cache is not None and (now - _ips_cache_ts) < _IPS_TTL:
+        return _ips_cache
+    ips = _enumerate_network_ips()
+    _ips_cache = ips
+    _ips_cache_ts = now
+    return ips
+
+_all_ips = get_all_network_ips(force=True)
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
     async_mode='threading',
+    async_handlers=False,
     ping_timeout=20,
     ping_interval=8,
     logger=False,
@@ -878,6 +1370,8 @@ radio_state = {
     "gain_value": GAIN_LEVELS[current_gain_level],
     "noise_level": current_noise_level,
     "noise_status": _t('noise.off'),
+    "ai_denoise": _ai_denoise_enabled,
+    "ai_atten_lim_db": _ai_atten_lim_db,
     "power": 25,
     "com_port": COM_PORT,
     "baud_rate": BAUD_RATE,
@@ -910,9 +1404,11 @@ def find_ffmpeg():
     """查找ffmpeg路径"""
     # 程序目录
     exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-    ffmpeg_path = os.path.join(exe_dir, 'ffmpeg', 'ffmpeg.exe')
-    if os.path.exists(ffmpeg_path):
-        return ffmpeg_path
+    internal_dir = os.path.join(exe_dir, '_internal')
+    for base in (internal_dir, exe_dir):
+        ffmpeg_path = os.path.join(base, 'ffmpeg', 'ffmpeg.exe')
+        if os.path.exists(ffmpeg_path):
+            return ffmpeg_path
     # 系统PATH
     for p in os.environ.get('PATH', '').split(os.pathsep):
         ffmpeg_path = os.path.join(p, 'ffmpeg.exe')
@@ -956,7 +1452,7 @@ def _video_watchdog(process, holder):
 
 def video_capture_worker_v2():
     """视频捕获线程 - FFmpeg版本 - 优化版（含错误诊断、假死看门狗与自动重启）"""
-    global _ffmpeg_process, video_running, _current_frame, _video_frame_seq, _video_fps
+    global _ffmpeg_process, video_running, _current_frame, _video_frame_seq, _video_fps, _video_stream_active
 
     fps = int(config['VIDEO'].get('FPS', 10))
     _video_fps = fps
@@ -965,25 +1461,21 @@ def video_capture_worker_v2():
     height = int(config['VIDEO'].get('HEIGHT', 240))
     dev_name = config['VIDEO'].get('DEVICE_NAME', 'USB Video')
 
-    cmd = [
-        None,  # ffmpeg path, filled below
-        '-y',
-        '-f', 'dshow',
-        '-rtbufsize', '64M',          # 采集缓冲加大，避免CPU繁忙时丢帧/缓冲溢出
-        '-video_size', '{}x{}'.format(width, height),
-        '-framerate', str(fps),
-        '-i', f'video={dev_name}',
-        '-vf', 'scale={}:{}'.format(width, height),
-        '-c:v', 'mjpeg',              # 显式指定输出 MJPEG，避免 image2pipe 默认编码器漂移
-        '-q:v', str(quality),
-        '-fflags', 'nobuffer',        # 禁用输出缓冲
-        '-f', 'image2pipe',
-        '-'
+    # 格式阶梯：先用用户配置，再尝试 640x480，最后用设备默认（不指定分辨率/帧率）。
+    # 部分 USB 采集卡只支持特定格式，配置值不匹配时会 "Could not set video options"。
+    size_ladder = [
+        (width, height, fps),
+        (640, 480, fps),
+        (None, None, None),
     ]
 
     CREATE_NO_WINDOW = 0x08000000
     stderr_lines = []
-    restart_backoff = 1  # 连续快速失败退避系数：1,2,3,4 封顶4（对应等待 1.5-6s）
+    restart_backoff = 1      # 连续快速失败退避系数：1,2,3,4 封顶4（对应等待 1.5-6s）
+    ladder_idx = 0           # 当前格式阶梯档位
+    zero_frame_fails = 0     # 连续"启动即0帧"失败次数（熔断计数）
+    banner_logged = False    # 日志节流：避免每次重试都刷 14 行 ffmpeg banner
+    CIRCUIT_LIMIT = 5        # 连续 0 帧失败上限：达到即暂停自动重试
 
     def _drain_stderr(pipe, buf):
         for raw in pipe:
@@ -996,15 +1488,32 @@ def video_capture_worker_v2():
                 if len(buf) > 200:
                     del buf[:100]
 
+    def _build_cmd(ffmpeg, w, h, f):
+        c = [ffmpeg, '-y', '-f', 'dshow', '-rtbufsize', '64M']
+        if w and h:
+            c += ['-video_size', '{}x{}'.format(w, h)]
+        if f:
+            c += ['-framerate', str(f)]
+        c += ['-i', 'video={}'.format(dev_name)]
+        c += ['-vf', 'scale={}:{}'.format(width, height)]
+        c += ['-c:v', 'mjpeg', '-q:v', str(quality), '-fflags', 'nobuffer',
+              '-f', 'image2pipe', '-']
+        return c
+
     while _video_stream_active:
         ffmpeg = find_ffmpeg()
         if not ffmpeg:
             log("未找到ffmpeg")
             return
-        cmd[0] = ffmpeg
         stderr_lines.clear()
 
-        log("FFmpeg: {}x{} {}fps MJPEG q={} (低延迟)".format(width, height, fps, quality))
+        w, h, f = size_ladder[ladder_idx]
+        cmd = _build_cmd(ffmpeg, w, h, f)
+
+        if w and h:
+            log("FFmpeg: {}x{} {}fps MJPEG q={} (低延迟)".format(w, h, f, quality))
+        else:
+            log("FFmpeg: 设备默认格式 MJPEG q={} (低延迟)".format(quality))
         try:
             _ffmpeg_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW)
             with _ffmpeg_pids_lock:
@@ -1083,6 +1592,8 @@ def video_capture_worker_v2():
                         _current_frame = frame
                         _video_frame_seq += 1
                     frame_count += 1
+                    if frame_count == 1:
+                        log("视频出帧正常（{}x{}）".format(w or '默认', h or '默认'))
                     if frame_count % 300 == 0:
                         log("视频采集: 累计{}帧, seq={}".format(frame_count, _video_frame_seq))
                 # 保护：异常数据流下避免缓冲区无限增长
@@ -1092,13 +1603,27 @@ def video_capture_worker_v2():
             proc = _ffmpeg_process
             if proc is not None:
                 code = proc.poll()
-                log("视频循环退出, 共{}帧".format(frame_count))
-                log("ffmpeg exit code={}".format(code))
-                if stderr_lines:
-                    tail = stderr_lines[-30:]
-                    log("--- ffmpeg stderr 最近{}行 ---".format(len(tail)))
-                    for l in tail:
-                        log("  " + l)
+                if frame_count == 0:
+                    # 日志节流：首次失败打印完整 stderr；后续只给一条摘要，避免刷屏
+                    if not banner_logged:
+                        log("视频循环退出, 共0帧 (设备无法打开/无信号)")
+                        log("ffmpeg exit code={}".format(code))
+                        if stderr_lines:
+                            tail = stderr_lines[-14:]
+                            log("--- ffmpeg stderr 最近{}行 ---".format(len(tail)))
+                            for l in tail:
+                                log("  " + l)
+                        banner_logged = True
+                    else:
+                        err = ''
+                        for l in reversed(stderr_lines):
+                            if l.strip():
+                                err = l.strip()
+                                break
+                        log("视频仍无帧(第{}次)：{}".format(zero_frame_fails + 1, err or '无 stderr'))
+                else:
+                    log("视频循环退出, 共{}帧".format(frame_count))
+                    log("ffmpeg exit code={}".format(code))
                 try:
                     if proc.poll() is None:
                         proc.terminate()
@@ -1121,16 +1646,45 @@ def video_capture_worker_v2():
         if not _video_stream_active:
             break
 
-        # 退避策略：运行时间过短(设备未释放/异常)则重试；但设备断流后应立即尝试恢复，
-        # 避免退避时间过长导致视频长时间黑屏。等待期间不断探测，设备释放即尽快重启。
-        if frame_count < 30:
+        # 熔断与格式阶梯：0 帧=设备打不开/无信号；有帧=正常结束或中途断流。
+        if frame_count == 0:
+            zero_frame_fails += 1
+            if ladder_idx < len(size_ladder) - 1:
+                ladder_idx += 1
+                log("改用 {} 格式重试".format('640x480' if ladder_idx == 1 else '设备默认'))
+            if zero_frame_fails >= CIRCUIT_LIMIT:
+                msg = _t('log.video.circuit')
+                log(msg)
+                try:
+                    socketio.emit('video_status_updated',
+                                  {'ok': False, 'status': 'stopped', 'msg': msg},
+                                  namespace='/', broadcast=True)
+                except Exception:
+                    pass
+                _video_stream_active = False
+                video_running = False
+                return
+            restart_backoff = min(restart_backoff + 1, 4)
+            wait_secs = min(1.5 * restart_backoff, 6.0)
+            log("视频捕获启动后很快失败(0帧)，{}s 后重试(第{}次)".format(wait_secs, zero_frame_fails))
+        elif frame_count < 30:
             restart_backoff = min(restart_backoff + 1, 4)  # 1,2,3,4 封顶4
             wait_secs = min(1.5 * restart_backoff, 6.0)
             log("视频捕获启动后很快失败({}帧)，{}s 后重试(第{}次)".format(
                 frame_count, wait_secs, restart_backoff))
         else:
+            # 成功运行过：复位阶梯/熔断/退避，并通知前端已恢复出帧
+            ladder_idx = 0
+            zero_frame_fails = 0
+            banner_logged = False
             restart_backoff = 1
             wait_secs = 3.0  # 正常结束后稳定等待，避免设备未释放
+            try:
+                socketio.emit('video_status_updated',
+                              {'ok': True, 'status': 'streaming'},
+                              namespace='/', broadcast=True)
+            except Exception:
+                pass
         wait_until = time.time() + wait_secs
         while _video_stream_active and time.time() < wait_until:
             time.sleep(0.2)
@@ -1192,19 +1746,20 @@ def stop_video_stream():
         _video_stream_active = False
         video_running = False
 
-        if _ffmpeg_process:
+        proc = _ffmpeg_process
+        if proc:
             try:
-                if _ffmpeg_process.poll() is None:
-                    _ffmpeg_process.terminate()
+                if proc.poll() is None:
+                    proc.terminate()
                     try:
-                        _ffmpeg_process.wait(timeout=3.0)
+                        proc.wait(timeout=3.0)
                     except Exception:
-                        _ffmpeg_process.kill()
-                        _ffmpeg_process.wait(timeout=1.0)
+                        proc.kill()
+                        proc.wait(timeout=1.0)
             except Exception:
                 pass
             with _ffmpeg_pids_lock:
-                _ffmpeg_spawned_pids.discard(_ffmpeg_process.pid)
+                _ffmpeg_spawned_pids.discard(proc.pid)
             _ffmpeg_process = None
 
         # 清理可能残留的本程序ffmpeg进程（设备未释放会导致后续启动失败）
@@ -1246,50 +1801,39 @@ def send_yaesu_cmd(cmd, value="", delay=0.05):
         if not ser or not ser.is_open:
             log(f"串口未连接，尝试自动重连...")
             try:
-                ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=1)
+                ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=1, write_timeout=1)
                 time.sleep(0.5)
                 init_yaesu_radio()
             except Exception as e:
                 log(f"串口自动重连失败：{e}")
                 return False
-        
-        # Yaesu FT-710 频率设置需要先选择VFO-A
+
+        # 写操作在锁内（微秒级原子）；响应读取与 sleep 移出锁执行，
+        # 避免慢响应头阻塞 PTT/频率等所有指令（原最坏持锁 ≈1s）
         if cmd == "FA":
             with lock:
-                vs_cmd = build_yaesu_cmd("VS", "0")
-                ser.write(vs_cmd.encode('ascii'))
+                ser.write(build_yaesu_cmd("VS", "0").encode('ascii'))
                 time.sleep(0.02)
-                raw_cmd = build_yaesu_cmd(cmd, value)
-                ser.write(raw_cmd.encode('ascii'))
-                time.sleep(delay)
-                resp = b""
-                try:
-                    read_count = 0
-                    while ser.in_waiting > 0 and read_count < 20:
-                        resp += ser.read(ser.in_waiting)
-                        time.sleep(0.05)
-                        read_count += 1
-                except:
-                    pass
+                ser.write(build_yaesu_cmd(cmd, value).encode('ascii'))
         else:
-            raw_cmd = build_yaesu_cmd(cmd, value)
             with lock:
-                ser.write(raw_cmd.encode('ascii'))
-                time.sleep(delay)
-                resp = b""
-                try:
-                    read_count = 0
-                    while ser.in_waiting > 0 and read_count < 20:
-                        resp += ser.read(ser.in_waiting)
-                        time.sleep(0.05)
-                        read_count += 1
-                except:
-                    pass
-        
+                ser.write(build_yaesu_cmd(cmd, value).encode('ascii'))
+
+        time.sleep(delay)
+        resp = b""
+        try:
+            read_count = 0
+            while ser.in_waiting > 0 and read_count < 20:
+                resp += ser.read(ser.in_waiting)
+                time.sleep(0.05)
+                read_count += 1
+        except Exception:
+            pass
+
         log(f"发送电台指令：{cmd} = {value}")
         if resp:
             log(f"电台响应：{resp.decode('ascii', errors='ignore').strip()}")
-        
+
         return True
     except Exception as e:
         log(f"发送指令失败：{e}")
@@ -1449,7 +1993,7 @@ def init_com(port=None, baud=None):
         try:
             if ser and ser.is_open:
                 ser.close()
-            ser = serial.Serial(use_port, use_baud, timeout=1)
+            ser = serial.Serial(use_port, use_baud, timeout=1, write_timeout=1)
             time.sleep(0.5)
             radio_state["com_port"] = use_port
             radio_state["baud_rate"] = use_baud
@@ -1557,7 +2101,7 @@ _NB_SAMPLE_MULT   = 4.0
 def apply_noise_blanker(audio):
     global _nb_history
     audio = audio.copy()
-    frame_rms = float(np.sqrt(np.mean(audio ** 2)))
+    frame_rms = _frame_rms(audio)
     
     if len(_nb_history) >= 3:
         bg_rms = float(np.median(list(_nb_history)))
@@ -1581,44 +2125,45 @@ def apply_noise_reduction(audio, level):
     if not noise_config["enabled"]:
         return audio
 
-    rms = float(np.sqrt(np.mean(audio ** 2)))
+    rms = _frame_rms(audio)
     gate = noise_config["gate"]
     aggr = noise_config["aggressiveness"]
 
     global _noise_profile
-    fft = np.fft.rfft(audio)
-    power = np.abs(fft) ** 2
+    with _noise_profile_lock:
+        fft = np.fft.rfft(audio)
+        power = np.abs(fft) ** 2
 
-    if _noise_profile["spectrum"] is None:
-        buf = _noise_profile["init_buffer"]
-        needed = _noise_profile["init_frames_needed"]
-        if len(buf) < needed:
-            buf.append(power.copy())
-        if len(buf) >= needed:
-            init_spectrum = np.min(buf, axis=0)
-            _noise_profile["spectrum"]          = init_spectrum.copy()
-            _noise_profile["history"]           = [init_spectrum.copy()] * _noise_profile["history_len"]
-            _noise_profile["smoothed_spectrum"]  = init_spectrum.copy()
-            _noise_profile["init_buffer"]       = []
-            log("噪声谱初始化完成")
+        if _noise_profile["spectrum"] is None:
+            buf = _noise_profile["init_buffer"]
+            needed = _noise_profile["init_frames_needed"]
+            if len(buf) < needed:
+                buf.append(power.copy())
+            if len(buf) >= needed:
+                init_spectrum = np.min(buf, axis=0)
+                _noise_profile["spectrum"]          = init_spectrum.copy()
+                _noise_profile["history"]           = [init_spectrum.copy()] * _noise_profile["history_len"]
+                _noise_profile["smoothed_spectrum"]  = init_spectrum.copy()
+                _noise_profile["init_buffer"]       = []
+                log("噪声谱初始化完成")
+            else:
+                return audio
         else:
-            return audio
-    else:
-        if rms < gate * 1.5:
-            alpha = 0.1
-        else:
-            alpha = 0.03
-        updated = (1 - alpha) * _noise_profile["spectrum"] + alpha * power
-        _noise_profile["spectrum"] = updated
-        _noise_profile["history"].pop(0)
-        _noise_profile["history"].append(updated.copy())
-        _noise_profile["smoothed_spectrum"] = np.min(_noise_profile["history"], axis=0)
+            if rms < gate * 1.5:
+                alpha = 0.1
+            else:
+                alpha = 0.03
+            updated = (1 - alpha) * _noise_profile["spectrum"] + alpha * power
+            _noise_profile["spectrum"] = updated
+            _noise_profile["history"].pop(0)
+            _noise_profile["history"].append(updated.copy())
+            _noise_profile["smoothed_spectrum"] = np.min(_noise_profile["history"], axis=0)
 
-    if level == 5:
-        noise_est = _noise_profile["smoothed_spectrum"] * 2.0
-    else:
-        noise_est = _noise_profile["smoothed_spectrum"] * 1.05
-    
+        if level == 5:
+            noise_est = _noise_profile["smoothed_spectrum"] * 2.0
+        else:
+            noise_est = _noise_profile["smoothed_spectrum"] * 1.05
+
     clean_power = np.maximum(power - aggr * noise_est, 0.0)
     gain = np.where(power > 1e-12, np.sqrt(clean_power / (power + 1e-12)), 0.0)
 
@@ -1647,17 +2192,29 @@ def _try_open_streams(device_in, device_out, samplerate, dtype):
         latency='low',
         never_drop_input=False
     )
-    in_stream.start()
-    out_stream = sd.OutputStream(
-        samplerate=samplerate,
-        channels=CHANNELS,
-        blocksize=AUDIO_BLOCK_SIZE,
-        dtype=dtype,
-        device=device_out,
-        latency='low'
-    )
-    out_stream.start()
-    return in_stream, out_stream
+    try:
+        in_stream.start()
+        out_stream = sd.OutputStream(
+            samplerate=samplerate,
+            channels=CHANNELS,
+            blocksize=AUDIO_BLOCK_SIZE,
+            dtype=dtype,
+            device=device_out,
+            latency='low'
+        )
+        out_stream.start()
+        return in_stream, out_stream
+    except Exception:
+        # 失败回滚：输出流失败时，已打开的输入流必须关闭，否则回调持续写 RingBuffer 泄漏
+        try:
+            in_stream.stop()
+        except Exception:
+            pass
+        try:
+            in_stream.close()
+        except Exception:
+            pass
+        raise
 
 
 def init_audio_streams():
@@ -1671,7 +2228,29 @@ def init_audio_streams():
     
     dev_in  = int(configured_dev_in) if configured_dev_in != '-1' else -1
     dev_out = int(configured_dev_out) if configured_dev_out != '-1' else -1
-    
+
+    # 按名称优先匹配设备：Windows 设备索引会随 USB 重枚举漂移，
+    # 只存索引会导致重启后抓到错误设备（RX 静音）。名称稳定，优先使用。
+    name_in  = str(config['AUDIO'].get('DEVICE_IN_NAME', '')).strip()
+    name_out = str(config['AUDIO'].get('DEVICE_OUT_NAME', '')).strip()
+    if name_in or name_out:
+        try:
+            _devs = sd.query_devices()
+        except Exception:
+            _devs = []
+        if name_in:
+            for i, d in enumerate(_devs):
+                if d.get('max_input_channels', 0) > 0 and name_in.lower() in str(d.get('name', '')).lower():
+                    dev_in = i
+                    log(f"按名称匹配输入设备：{name_in} -> [{i}] {d.get('name')}")
+                    break
+        if name_out:
+            for i, d in enumerate(_devs):
+                if d.get('max_output_channels', 0) > 0 and name_out.lower() in str(d.get('name', '')).lower():
+                    dev_out = i
+                    log(f"按名称匹配输出设备：{name_out} -> [{i}] {d.get('name')}")
+                    break
+
     if dev_in >= 0 or dev_out >= 0:
         log(f"使用配置的音频设备：输入={dev_in} 输出={dev_out}")
 
@@ -1787,22 +2366,37 @@ def audio_input_callback(indata, frames, time_info, status):
         return
     if status and status.input_underflow:
         return
-    global _ring_write
+    global _ring_write, _ring_read, _ring_overflow_count, _ring_last_overflow_log
+    do_log = False
     with _ring_lock:
         samples = indata[:, 0]
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32) / 32768.0
+        # 环满保护：写指针将追平读指针时，丢弃最旧一帧并计数（避免撕裂读）
+        if (_ring_write + 1) % _RING_SIZE == _ring_read:
+            _ring_read = (_ring_read + 1) % _RING_SIZE
+            _ring_overflow_count += 1
+            now = time.monotonic()
+            if now - _ring_last_overflow_log >= 2.0:
+                _ring_last_overflow_log = now
+                do_log = True
         _ring_buf[_ring_write % _RING_SIZE] = samples
         _ring_write = (_ring_write + 1) % _RING_SIZE
+    if do_log:
+        try:
+            log(f"RingBuffer溢出，丢最旧帧（累计{_ring_overflow_count}）")
+        except Exception:
+            pass
     _ring_event.set()
 
 def _reset_dsp_state():
     global _rx_zi, _noise_profile
     _rx_zi = _sosfilt_zi(_rx_sos) * 0.0
-    _noise_profile["spectrum"] = None
-    _noise_profile["history"] = []
-    _noise_profile["smoothed_spectrum"] = None
-    _noise_profile["init_buffer"] = []
+    with _noise_profile_lock:
+        _noise_profile["spectrum"] = None
+        _noise_profile["history"] = []
+        _noise_profile["smoothed_spectrum"] = None
+        _noise_profile["init_buffer"] = []
     _reset_ring_buffer()
     _drain_send_queue()
     log("DSP状态已重置")
@@ -1814,7 +2408,7 @@ def _force_safe_rx():
         tx_active.clear()
         radio_state['trx'] = 'RX'
         send_radio("TRX", "0")
-        socketio.emit('trx_updated', {'trx': 'RX'}, namespace='/', broadcast=True)
+        socketio.emit('trx_updated', {'trx': 'RX'}, namespace='/')
 
 def restart_audio_streams():
     if not _audio_restart_lock.acquire(blocking=False):
@@ -1854,8 +2448,10 @@ def restart_audio_streams():
 
 def audio_watchdog():
     def _watch():
+        fail_streak = 0
         while not _running.is_set():
-            time.sleep(5)
+            # 指数退避：正常 5s 巡检；连续失败逐步放宽到 60s，避免坏设备下反复重启风暴
+            time.sleep(min(5 * (2 ** fail_streak), 60))
             if tx_active.is_set():
                 continue
             try:
@@ -1864,11 +2460,15 @@ def audio_watchdog():
                 if not input_ok:
                     log("看门狗：接收音频流异常，尝试恢复...")
                     restart_audio_streams()
+                    fail_streak += 1
                 elif not output_ok:
                     log("看门狗：发送音频流异常，尝试恢复...")
                     restart_audio_streams()
+                    fail_streak += 1
+                else:
+                    fail_streak = 0
             except Exception:
-                pass
+                fail_streak += 1
 
     t = _threading.Thread(target=_watch, daemon=True)
     t.start()
@@ -1882,7 +2482,7 @@ def _tx_timeout_watchdog():
                 send_radio("TRX", "0")
                 tx_active.clear()
                 radio_state['trx'] = 'RX'
-                socketio.emit('trx_updated', {'trx': 'RX'}, namespace='/', broadcast=True)
+                socketio.emit('trx_updated', {'trx': 'RX'}, namespace='/')
         time.sleep(5)
 
 def _get_audio_latency_ms():
@@ -2007,12 +2607,55 @@ def handle_connect():
         'mic_gain_level': current_mic_gain_level,
         'noise_level': noise_lv,
         'noise_status': noise_status,
+        'ai_denoise': _ai_denoise_enabled,
+        'ai_atten_lim_db': _ai_atten_lim_db,
         'ptt_mode': PTT_MODE,
         'power': radio_state.get('power', 25),
         'com_port': radio_state['com_port'],
         'baud_rate': radio_state['baud_rate'],
         'meter': radio_state.get('meter', {"pwr": 0, "ref": 0, "swr": 1.0, "eff": 0, "connected": False})
     }, namespace='/')
+
+
+@socketio.on('disconnect', namespace='/')
+def handle_disconnect():
+    log("客户端已断开")
+    # 射频安全：持有PTT的客户端掉线（浏览器崩溃/断网）时立即回收发射，不等180s看门狗
+    global _ptt_owner_sid
+    try:
+        sid = request.sid
+        if tx_active.is_set() and _ptt_owner_sid is not None and sid == _ptt_owner_sid:
+            log("发射客户端断开，自动切回RX")
+            send_radio("TRX", "0")
+            tx_active.clear()
+            radio_state['trx'] = 'RX'
+            _ptt_owner_sid = None
+            socketio.emit('trx_updated', {'trx': 'RX'}, namespace='/')
+    except Exception as e:
+        log(f"断开清理失败：{e}")
+
+
+@socketio.on('client_diag', namespace='/')
+def handle_client_diag(data):
+    """客户端播放链路诊断上报（WebRTC/音频激活失败等）。按类型 60s 节流。"""
+    try:
+        kind = str(data.get('kind', 'unknown'))[:40]
+        detail = str(data.get('detail', ''))[:300]
+    except Exception:
+        return
+    now = time.monotonic()
+    if now - _client_diag_last.get(kind, 0.0) < 60.0:
+        return
+    if len(_client_diag_last) >= _CLIENT_DIAG_MAX:
+        for k in [k for k, t in _client_diag_last.items() if now - t > _CLIENT_DIAG_TTL]:
+            del _client_diag_last[k]
+        while len(_client_diag_last) >= _CLIENT_DIAG_MAX:
+            del _client_diag_last[min(_client_diag_last, key=_client_diag_last.get)]
+    _client_diag_last[kind] = now
+    try:
+        log(f"客户端诊断[{kind}]: {detail}")
+    except Exception:
+        pass
 
 
 @socketio.on('ptt_change', namespace='/')
@@ -2037,9 +2680,10 @@ def handle_ptt_change(data):
         radio_state['trx'] = t
         log(f"PTT切换：{t} (模式: {mode})")
 
-        global audio_output_stream, audio_input_stream, _rx_start_seq, tx_start_time
+        global audio_output_stream, audio_input_stream, _rx_start_seq, tx_start_time, _ptt_owner_sid
 
         if t == "TX":
+            _ptt_owner_sid = request.sid
             tx_active.set()
             tx_start_time = time.monotonic()
             _rx_start_seq = (_rx_start_seq + 1) % 65536
@@ -2049,6 +2693,7 @@ def handle_ptt_change(data):
             _drain_send_queue()
         else:
             tx_active.clear()
+            _ptt_owner_sid = None
             _tx_squelch_until = time.monotonic() + 0.10
             _drain_send_queue()
             _reset_ring_buffer()
@@ -2107,14 +2752,80 @@ def handle_set_noise_level(data):
         radio_state["noise_status"] = _noise_text(level)
     
     global _noise_profile
-    _noise_profile["spectrum"] = None
-    _noise_profile["history"] = []
+    with _noise_profile_lock:
+        _noise_profile["spectrum"] = None
+        _noise_profile["history"] = []
     
     status_text = "关闭" if level == 0 else f"{level}级"
     log(f"降噪等级已设置为：{status_text}")
     emit('noise_level_updated', {
         'level': level,
         'status': status_text
+    }, namespace='/', broadcast=True)
+
+
+@socketio.on('set_ai_denoise', namespace='/')
+def handle_set_ai_denoise(data):
+    """神经网络降噪开关（DeepFilterNet3）。开启时 DSP 走 DFN3，
+    与 1-5 级谱减法互斥（AI 关闭后自动恢复原等级）。"""
+    global _ai_denoise_enabled, _ai_enable_want, _ai_loading, _ai_circuit_open
+    global _ai_fail_count, _ai_circuit_until
+    want = bool(data.get('enabled', False))
+    log_msg = None
+    emit_msg = None
+    _start_worker = False
+    with _ai_load_lock:
+        _ai_enable_want = want
+        if not want:
+            _ai_denoise_enabled = False
+            radio_state["ai_denoise"] = False
+            if _ai_loading:
+                log_msg = "关闭神经网络降噪（后台加载完成后保持关闭）"
+            else:
+                log_msg = "神经网络降噪已关闭（恢复 1-5 级谱减法）"
+            emit_msg = {'enabled': False}
+        elif _ai_denoise_enabled:
+            emit_msg = {'enabled': True}
+        elif _ai_circuit_open:
+            if time.monotonic() >= _ai_circuit_until:
+                _ai_circuit_open = False
+                _ai_fail_count = 0
+                log_msg = "神经网络降噪熔断冷却到期，允许重试"
+                emit_msg = {'enabled': False, 'loading': True}
+                _ai_loading = True
+                _start_worker = True
+            else:
+                emit_msg = {'enabled': False, 'error': _ai_load_error,
+                            'circuit_open': True}
+        elif _ai_loading:
+            emit_msg = {'enabled': False, 'loading': True}
+        else:
+            emit_msg = {'enabled': False, 'loading': True}
+            _ai_loading = True
+            _start_worker = True
+    if log_msg:
+        log(log_msg)
+    emit('ai_denoise_updated', emit_msg, namespace='/', broadcast=True)
+    if _start_worker:
+        _threading.Thread(target=_ai_load_worker, daemon=True, name='AiLoad').start()
+
+
+@socketio.on('set_ai_denoise_params', namespace='/')
+def handle_set_ai_denoise_params(data):
+    """神经网络降噪微调：atten_lim_db（衰减上限dB，6-30，越小越保护弱语音）。"""
+    global _ai_atten_lim_db, _ai_params_pending
+    try:
+        atten = float(data.get('atten_lim_db', _ai_atten_lim_db))
+    except (TypeError, ValueError):
+        return
+    atten = round(min(30.0, max(6.0, atten)), 1)
+    _ai_atten_lim_db = atten
+    _ai_params_pending = True
+    config['AUDIO']['AI_ATTEN_LIM_DB'] = str(atten)
+    save_config(config)
+    log(f"神经网络降噪参数：衰减上限 {atten:g}dB")
+    emit('ai_denoise_params_updated', {
+        'atten_lim_db': atten
     }, namespace='/', broadcast=True)
 
 
@@ -2262,9 +2973,18 @@ def api_nb():
 @app.route('/api/freq', methods=['POST'])
 def api_freq():
     try:
-        f = request.json.get('f', 14.270)
+        f = request.json.get('f')
+        if f is None:
+            return jsonify({'status': 'error', 'msg': 'missing f'}), 400
+        try:
+            f = float(f)
+        except (TypeError, ValueError):
+            return jsonify({'status': 'error', 'msg': 'invalid f'}), 400
+        if not (0.030 <= f <= 999.999999):
+            return jsonify({'status': 'error', 'msg': 'f out of range'}), 400
+        f = round(f, 6)
         # FT-710 需要9位Hz数字，如14.270MHz = 014270000
-        freq_hz = int(f * 1000000)
+        freq_hz = int(round(f * 1000000))
         freq_str = f"{freq_hz:09d}"
         send_radio("TXF", freq_str)
         radio_state['frequency'] = f
@@ -2329,7 +3049,7 @@ def api_set_step():
 def api_mode():
     try:
         m = request.json.get('m', 'USB')
-        
+
         mode_map = {
             'USB': '02',
             'LSB': '01',
@@ -2339,10 +3059,11 @@ def api_mode():
             'FM': '04',
             'RTTY': '0C',
         }
-        
-        if m in mode_map:
-            send_radio("MODE", mode_map[m])
-        
+
+        if m not in mode_map:
+            return jsonify({'status': 'error', 'msg': f'unsupported mode: {m}'}), 400
+
+        send_radio("MODE", mode_map[m])
         radio_state['mode'] = m
         return jsonify({'status': 'ok', 'mode': m})
     except Exception as e:
@@ -2364,7 +3085,7 @@ def api_set_power():
 
 @app.route('/api/ptt', methods=['POST'])
 def api_ptt():
-    global tx_start_time, _rx_start_seq, _tx_squelch_until
+    global tx_start_time, _rx_start_seq, _tx_squelch_until, _ptt_owner_sid
     try:
         data = request.get_json()
         mode = data.get('mode', PTT_MODE)
@@ -2383,6 +3104,7 @@ def api_ptt():
 
         # 先设状态，再发串口（即使串口失败状态也正确）
         if t == "TX":
+            _ptt_owner_sid = None
             tx_active.set()
             tx_start_time = time.monotonic()
             _rx_start_seq = (_rx_start_seq + 1) % 65536
@@ -2391,6 +3113,7 @@ def api_ptt():
             _drain_send_queue()
         else:
             tx_active.clear()
+            _ptt_owner_sid = None
             _tx_squelch_until = time.monotonic() + 0.10
             _drain_send_queue()
             _reset_ring_buffer()
@@ -2483,13 +3206,23 @@ def api_save_channel():
         if not mode:
             mode = radio_state.get('mode', 'USB')
 
-        band = get_band_from_freq(float(freq))
+        if mode not in ('USB', 'LSB', 'CW', 'CWR', 'AM', 'FM', 'RTTY'):
+            return jsonify({'status': 'error', 'msg': f'unsupported mode: {mode}'}), 400
+        try:
+            freq = float(freq)
+        except (TypeError, ValueError):
+            return jsonify({'status': 'error', 'msg': 'invalid freq'}), 400
+        if not (0.030 <= freq <= 999.999999):
+            return jsonify({'status': 'error', 'msg': 'freq out of range'}), 400
+        freq = round(freq, 6)
+
+        band = get_band_from_freq(freq)
         if not band:
             return jsonify({'status': 'error', 'msg': _t('srv.channel.unsup')}), 400
 
         for existing_key, existing_value in config['CHANNELS'].items():
             parts = existing_value.split(',')
-            if parts and abs(float(parts[0]) - float(freq)) < 0.0001:
+            if parts and abs(float(parts[0]) - freq) < 0.0001:
                 return jsonify({'status': 'error', 'msg': _t('srv.channel.dup', f=freq)}), 400
 
         existing_keys = [k for k in config['CHANNELS'].keys() if k.startswith(f'ch_{band}_')]
@@ -2527,11 +3260,19 @@ def api_set_channel():
             'FM': '04',
             'RTTY': '0C',
         }
-        mode_code = mode_map.get(mode, '02')
-        send_radio("MODE", mode_code)
+        if mode not in mode_map:
+            return jsonify({'status': 'error', 'msg': f'unsupported mode: {mode}'}), 400
+        mode_code = mode_map[mode]
 
-        f = float(freq)
-        freq_hz = int(f * 1000000)
+        try:
+            f = float(freq)
+        except (TypeError, ValueError):
+            return jsonify({'status': 'error', 'msg': 'invalid freq'}), 400
+        if not (0.030 <= f <= 999.999999):
+            return jsonify({'status': 'error', 'msg': 'freq out of range'}), 400
+        f = round(f, 6)
+        send_radio("MODE", mode_code)
+        freq_hz = int(round(f * 1000000))
         freq_str = f"{freq_hz:09d}"
         send_radio("TXF", freq_str)
         send_radio("RXF", freq_str)
@@ -2566,7 +3307,12 @@ def api_update_channel():
         mode = parts[1] if len(parts) > 1 else 'USB'
         label = parts[2] if len(parts) > 2 else ''
         if new_freq:
-            f = float(new_freq)
+            try:
+                f = float(new_freq)
+            except (TypeError, ValueError):
+                return jsonify({'status': 'error', 'msg': 'invalid freq'}), 400
+            if not (0.030 <= f <= 999.999999):
+                return jsonify({'status': 'error', 'msg': 'freq out of range'}), 400
             band = get_band_from_freq(f)
             if band:
                 freq = f
@@ -2641,9 +3387,45 @@ def api_video_config():
 
 
 # ===================== Web UI =====================
+@app.after_request
+def _gzip_and_etag(resp):
+    """仅对 text/html 页面做 gzip 压缩 + ETag 304 协商缓存。
+    刻意不碰 /socket.io 轮询与 /api/* ：304/压缩会破坏 engineio 长轮询
+    与 JS 轮询调用的 JSON 解析，只对整页首次加载收益最大的场景启用。"""
+    if (resp.status_code != 200
+            or not resp.content_type
+            or resp.content_type.split(';')[0].strip().lower() != 'text/html'):
+        return resp
+    try:
+        data = resp.get_data()
+    except Exception:
+        return resp
+    if not data:
+        return resp
+    import hashlib
+    etag = '"' + hashlib.md5(data).hexdigest() + '"'
+    resp.headers['ETag'] = etag
+    if request.headers.get('If-None-Match') == etag:
+        resp.set_data(b'')
+        resp.status_code = 304
+        return resp
+    if 'gzip' in (request.headers.get('Accept-Encoding') or ''):
+        import gzip
+        try:
+            data = gzip.compress(data)
+        except Exception:
+            data = None
+        if data:
+            resp.set_data(data)
+            resp.headers['Content-Encoding'] = 'gzip'
+            resp.headers['Vary'] = 'Accept-Encoding'
+    return resp
+
+
 @app.route('/')
 def page():
-    ip = _all_ips[0] if _all_ips else socket.gethostbyname(socket.gethostname())
+    _ips = get_all_network_ips()
+    ip = _ips[0] if _ips else socket.gethostbyname(socket.gethostname())
     return f'''
 <!DOCTYPE html>
 <html lang="{LANG}">
@@ -2981,6 +3763,52 @@ body::after {{
   color:#fff; border-color:transparent;
   box-shadow: 0 3px 12px var(--accent-glow);
 }}
+
+.level-slider {{
+  -webkit-appearance:none; appearance:none;
+  width:100%; height:6px; border-radius:3px;
+  background: linear-gradient(90deg, var(--accent), #3aabff);
+  outline:none; margin:8px 0 2px; cursor:pointer;
+}}
+.level-slider::-webkit-slider-thumb {{
+  -webkit-appearance:none; appearance:none;
+  width:18px; height:18px; border-radius:50%;
+  background:#fff; border:2px solid var(--accent);
+  box-shadow:0 2px 6px var(--accent-glow); cursor:pointer;
+}}
+.level-slider::-moz-range-thumb {{
+  width:18px; height:18px; border-radius:50%;
+  background:#fff; border:2px solid var(--accent);
+  box-shadow:0 2px 6px var(--accent-glow); cursor:pointer;
+}}
+.level-ticks {{
+  display:flex; justify-content:space-between;
+  font-size:10px; color:var(--text3); margin-top:2px;
+}}
+
+/* 神经网络降噪（DeepFilterNet3） */
+.sw {{
+  position:relative; box-sizing:border-box; flex:none; width:48px; height:26px;
+  border:1px solid var(--glass-border); border-radius:13px;
+  background:rgba(120,130,140,.30); cursor:pointer;
+  transition:background .2s, box-shadow .2s;
+}}
+.sw-knob {{
+  position:absolute; top:2px; left:2px; box-sizing:border-box;
+  width:20px; height:20px; border-radius:50%; background:#fff;
+  box-shadow:0 1px 4px rgba(0,0,0,.35); transition:left .18s;
+}}
+.sw.on {{ background:linear-gradient(135deg,var(--accent),#3aabff); border-color:transparent; box-shadow:0 3px 12px var(--accent-glow); }}
+.sw.on .sw-knob {{ left:24px; }}
+.sw.loading {{ animation:swPulse 1s ease-in-out infinite; }}
+@keyframes swPulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:.35; }} }}
+.sw:active {{ transform:scale(0.96); }}
+.sw-text {{ font-size:12px; color:var(--text2); opacity:.55; cursor:pointer; user-select:none; transition:color .15s, opacity .15s; }}
+.sw-text.active {{ opacity:1; color:var(--accent); font-weight:700; }}
+.ai-hint {{ flex:2; font-size:11px; color:var(--text2); opacity:.7; align-self:center; }}
+.ai-row {{ display:flex; align-items:center; gap:10px; }}
+.ai-atten-row {{ margin-top:8px; transition:opacity .15s; }}
+.ai-atten-row.disabled {{ opacity:.45; pointer-events:none; }}
 
 .status-freq-row {{
   display: flex;
@@ -3345,6 +4173,40 @@ body::after {{
   background: linear-gradient(135deg, var(--accent), #3aabff);
   color: #fff;
 }}
+
+/* 移动端/窄屏自适应 */
+@media (max-width: 560px) {{
+  body {{ padding: 6px; }}
+  .card {{ padding: 12px 10px; border-radius: 14px; }}
+  .main-title {{ font-size: 20px; }}
+  .freq-value {{ font-size: 34px; }}
+  .status-grid {{ grid-template-columns: 1fr 1fr; }}
+  .level-slider {{ height: 8px; }}
+  .level-slider::-webkit-slider-thumb {{ width: 22px; height: 22px; }}
+  .level-btn {{ font-size: 11px; }}
+}}
+/* 宽屏居中收敛，避免卡片被拉得过宽 */
+@media (min-width: 820px) {{
+  .card {{ max-width: 680px; margin-left: auto; margin-right: auto; }}
+}}
+/* 主控制区：竖屏单列；横屏左右两列平均分配（左＝状态+增益/降噪/功率，右＝视频+频率/信道/PTT） */
+.board {{ display: flex; flex-direction: column; }}
+.board-col {{ display: contents; }}
+.status-box {{ order: 1; }}
+.video-container {{ order: 2; }}
+.channel-bar {{ order: 3; }}
+.freq-control-container {{ order: 4; }}
+#ptt_btn {{ order: 5; }}
+.ptt-mode-selector {{ order: 6; }}
+.ctrl-row {{ order: 7; }}
+.level-control {{ order: 8; }}
+@media (orientation: landscape) and (min-width: 720px) {{
+  .card {{ max-width: 1120px; }}
+  .board {{ display: grid; grid-template-columns: 1fr 1fr; column-gap: 16px; align-items: start; }}
+  .board-col {{ display: flex; flex-direction: column; gap: 12px; }}
+  /* 两列模块间距统一交给 gap，避免左右两列首个模块因外边距不同而顶部错位 */
+  .board-col > * {{ margin-top: 0 !important; margin-bottom: 0 !important; }}
+}}
 </style>
 </head>
 <body>
@@ -3354,6 +4216,8 @@ body::after {{
     <div class="subtitle">Designed by BI4IXO</div>
 </div>
 
+<div class="board">
+<div class="board-col board-left">
 <div class="status-box">
     <div class="status-freq-row">
         <span class="status-freq-label" data-i18n="ws.status-freq">频率</span>
@@ -3388,6 +4252,63 @@ body::after {{
     </div>
 </div>
 
+<div class="level-control">
+    <div class="level-title"><span data-i18n="ws.gain.rx">🔊 接收增益</span><span class="level-value" id="gain-status">1.0x</span></div>
+    <input type="range" class="level-slider" id="gain-slider" min="0" max="18" step="1" value="2" oninput="setGainLevel(parseInt(this.value))">
+    <div class="level-ticks"><span>0.5x</span><span>2.75x</span><span>5.0x</span></div>
+</div>
+
+<div class="level-control">
+    <div class="level-title"><span data-i18n="ws.gain.mic">🎙️ 麦克风增益</span><span class="level-value" id="mic-gain-status">200%</span></div>
+    <input type="range" class="level-slider" id="mic-gain-slider" min="0" max="4" step="1" value="4" oninput="setMicGainLevel(parseInt(this.value))">
+    <div class="level-ticks"><span>100%</span><span>150%</span><span>200%</span></div>
+</div>
+
+<div class="level-control">
+    <div class="level-title"><span data-i18n="ws.ai.title">✨ 神经网络降噪</span></div>
+    <div class="ai-row">
+        <span class="sw-text active" id="ai-lbl-off" onclick="setAiDenoise(false)" data-i18n="ws.ai.off">关闭</span>
+        <div class="sw" id="ai-switch" onclick="toggleAiDenoise()" title="神经网络降噪(DeepFilterNet3)"><span class="sw-knob"></span></div>
+        <span class="sw-text" id="ai-lbl-on" onclick="setAiDenoise(true)" data-i18n="ws.ai.on">开启</span>
+        <span class="ai-hint" data-i18n="ws.ai.hint">DFN3 · 开启后谱减法暂停</span>
+    </div>
+    <div class="ai-atten-row disabled" id="ai-atten-row">
+        <div class="level-title" style="margin-bottom:2px;"><span data-i18n="ws.ai.atten">降噪强度</span><span class="level-value" id="ai-atten-val">-12dB</span></div>
+        <input type="range" class="level-slider" id="ai-atten-slider" min="6" max="30" step="1" value="12" oninput="onAiParamInput()" disabled>
+    </div>
+</div>
+
+<div class="level-control" id="noise-control">
+    <div class="level-title"><span data-i18n="ws.noise">🔇 DSP降噪</span><span class="level-value" id="noise-status">关闭</span></div>
+    <input type="range" class="level-slider" id="noise-slider" min="0" max="5" step="1" value="0" oninput="setNoiseLevel(parseInt(this.value))">
+    <div class="level-ticks"><span>关闭</span><span>3级</span><span>5级</span></div>
+</div>
+
+<div class="level-control" style="display:none;">
+    <div class="level-title"><span data-i18n="ws.tuner.title">📡 天线调谐器</span><span class="level-value" id="tuner-status">OFF</span></div>
+    <div class="level-buttons">
+        <button class="level-btn tuner-toggle" onclick="toggleTuner()" data-i18n="ws.tuner.toggle">开关</button>
+        <button class="level-btn tuner-start" 
+            ontouchstart="startTune(event)" 
+            ontouchend="stopTune(event)"
+            onmousedown="startTune(event)"
+            onmouseup="stopTune(event)"
+            onmouseleave="stopTune(event)" data-i18n="ws.tuner.start">🔄 调谐</button>
+    </div>
+</div>
+
+<div class="level-control">
+    <div class="level-title"><span data-i18n="ws.power">⚡ 发射功率</span><span class="level-value" id="power-status">25%</span></div>
+    <div class="level-buttons">
+        <button class="level-btn power-0" onclick="setPower(10)">10%</button>
+        <button class="level-btn power-1" onclick="setPower(25)">25%</button>
+        <button class="level-btn power-2" onclick="setPower(50)">50%</button>
+        <button class="level-btn power-3" onclick="setPower(75)">75%</button>
+        <button class="level-btn power-4" onclick="setPower(100)">100%</button>
+    </div>
+</div>
+</div>
+<div class="board-col board-right">
 <div class="video-container" id="video-container" style="display:none;">
     <div class="video-header">
         <span data-i18n="ws.video.screen">📷 电台屏幕</span>
@@ -3477,67 +4398,12 @@ body::after {{
     <span class="ptt-status" id="ptt-status">🔴 RX</span>
 </div>
 
-<div style="display:flex; gap:8px; margin-top:10px;">
+<div class="ctrl-row" style="display:flex; gap:8px; margin-top:10px;">
     <button id="activate-audio" class="activate-btn confirm-btn" style="flex:1;" data-i18n="ws.btn.act">🎧 激活音频</button>
     <button class="restart-btn" onclick="restartAudio()" style="flex:1; margin-top:0;" data-i18n="ws.btn.restart">🔄 重启音频</button>
 </div>
 
-<div class="level-control">
-    <div class="level-title"><span data-i18n="ws.gain.rx">🔊 接收增益（5级，0.5x~2.5x）</span><span class="level-value" id="gain-status">1.0x</span></div>
-    <div class="level-buttons">
-        <button class="level-btn gain-0" onclick="setGainLevel(0)">0.5x</button>
-        <button class="level-btn gain-1" onclick="setGainLevel(1)">1.0x</button>
-        <button class="level-btn gain-2" onclick="setGainLevel(2)">1.5x</button>
-        <button class="level-btn gain-3" onclick="setGainLevel(3)">2.0x</button>
-        <button class="level-btn gain-4" onclick="setGainLevel(4)">2.5x</button>
-    </div>
 </div>
-
-<div class="level-control">
-    <div class="level-title"><span data-i18n="ws.gain.mic">🎙️ 麦克风增益</span><span class="level-value" id="mic-gain-status">100%</span></div>
-    <div class="level-buttons">
-        <button class="level-btn mic-0" onclick="setMicGainLevel(0)">100%</button>
-        <button class="level-btn mic-1" onclick="setMicGainLevel(1)">125%</button>
-        <button class="level-btn mic-2" onclick="setMicGainLevel(2)">150%</button>
-        <button class="level-btn mic-3" onclick="setMicGainLevel(3)">175%</button>
-        <button class="level-btn mic-4" onclick="setMicGainLevel(4)">200%</button>
-    </div>
-</div>
-
-<div class="level-control">
-    <div class="level-title"><span data-i18n="ws.noise">🔇 DSP降噪</span><span class="level-value" id="noise-status">关闭</span></div>
-    <div class="level-buttons">
-        <button class="level-btn noise-0" onclick="setNoiseLevel(0)" data-i18n="noise.off">关闭</button>
-        <button class="level-btn noise-1" onclick="setNoiseLevel(1)" data-i18n="noise.lvl1">1级</button>
-        <button class="level-btn noise-2" onclick="setNoiseLevel(2)" data-i18n="noise.lvl2">2级</button>
-        <button class="level-btn noise-3" onclick="setNoiseLevel(3)" data-i18n="noise.lvl3">3级</button>
-        <button class="level-btn noise-4" onclick="setNoiseLevel(4)" data-i18n="noise.lvl4">4级</button>
-        <button class="level-btn noise-5" onclick="setNoiseLevel(5)" data-i18n="noise.lvl5">5级</button>
-    </div>
-</div>
-
-<div class="level-control" style="display:none;">
-    <div class="level-title"><span data-i18n="ws.tuner.title">📡 天线调谐器</span><span class="level-value" id="tuner-status">OFF</span></div>
-    <div class="level-buttons">
-        <button class="level-btn tuner-toggle" onclick="toggleTuner()" data-i18n="ws.tuner.toggle">开关</button>
-        <button class="level-btn tuner-start" 
-            ontouchstart="startTune(event)" 
-            ontouchend="stopTune(event)"
-            onmousedown="startTune(event)"
-            onmouseup="stopTune(event)"
-            onmouseleave="stopTune(event)" data-i18n="ws.tuner.start">🔄 调谐</button>
-    </div>
-</div>
-
-<div class="level-control">
-    <div class="level-title"><span data-i18n="ws.power">⚡ 发射功率</span><span class="level-value" id="power-status">25%</span></div>
-    <div class="level-buttons">
-        <button class="level-btn power-0" onclick="setPower(10)">10%</button>
-        <button class="level-btn power-1" onclick="setPower(25)">25%</button>
-        <button class="level-btn power-2" onclick="setPower(50)">50%</button>
-        <button class="level-btn power-3" onclick="setPower(75)">75%</button>
-        <button class="level-btn power-4" onclick="setPower(100)">100%</button>
-    </div>
 </div>
 
 <div class="copyright">
@@ -3555,7 +4421,7 @@ let isPTTHeld = false;
 let isAudioReady = false;
 let freqStep = 0.001;
 let isFreqInputEditing = false;
-let currentGainLevel = 1;
+let currentGainLevel = 2;
 let currentNoiseLevel = 0;
 let currentMicGainLevel = 0; // 默认100%
 let currentPttMode = 'momentary';
@@ -3566,6 +4432,10 @@ let pttTxRetry = null;
 let pttTxRetryCount = 0;
 const MIC_GAIN_LEVELS = [1.00, 1.25, 1.50, 1.75, 2.00];
 const MIC_GAIN_LABELS = ['100%','125%','150%','175%','200%'];
+const GAIN_LABELS = ['0.5x','0.75x','1.0x','1.25x','1.5x','1.75x','2.0x','2.25x','2.5x','2.75x','3.0x','3.25x','3.5x','3.75x','4.0x','4.25x','4.5x','4.75x','5.0x'];
+let currentAiDenoise = false; // 神经网络降噪开关（DeepFilterNet3）
+let aiLoading = false;        // 后台加载中
+let currentAiAttenLim = 12;   // 衰减上限dB
 const SAMPLING_RATE = {SAMPLING_RATE};
 const AUDIO_BLOCK_SIZE = {AUDIO_BLOCK_SIZE};
 const SERVER_PORT = {SERVER_PORT};
@@ -3575,9 +4445,9 @@ let channelData = {{}};
 
 function initSocket() {{
     socket = io(window.location.origin, {{
-        reconnection: true,
-        reconnectionAttempts: 10,
-        reconnectionDelay: 2000,
+            reconnection: true,
+            reconnectionAttempts: Infinity,
+            reconnectionDelay: 2000,
         transports: ['polling', 'websocket'],
         upgrade: true,
         upgradeTimeout: 15000,
@@ -3629,6 +4499,15 @@ function initSocket() {{
         currentNoiseLevel = data.noise_level;
         updateNoiseButtons();
         document.getElementById('noise-status').textContent = data.noise_status;
+
+        if (data.ai_denoise !== undefined) {{
+            currentAiDenoise = data.ai_denoise;
+            updateAiUI();
+        }}
+        if (data.ai_atten_lim_db !== undefined) {{
+            currentAiAttenLim = data.ai_atten_lim_db;
+            syncAiParamSliders();
+        }}
         
         if (data.ptt_mode !== undefined) {{
             currentPttMode = data.ptt_mode;
@@ -3664,6 +4543,24 @@ function initSocket() {{
         currentMicGainLevel = data.level;
         updateMicGainButtons();
         document.getElementById('mic-gain-status').textContent = data.percent;
+    }});
+    
+    socket.on('ai_denoise_updated', (data) => {{
+        if (data.loading !== undefined) aiLoading = data.loading;
+        if (data.enabled !== undefined) {{
+            currentAiDenoise = data.enabled;
+            aiLoading = false;
+        }}
+        if (data.error !== undefined) setAiHint(String(data.error), true);
+        if (data.circuit_open) setAiHint(T('ws.ai.circuit'), true);
+        updateAiUI();
+    }});
+    
+    socket.on('ai_denoise_params_updated', (data) => {{
+        if (data.atten_lim_db !== undefined) {{
+            currentAiAttenLim = data.atten_lim_db;
+            syncAiParamSliders();
+        }}
     }});
     
     socket.on('ptt_mode_updated', (data) => {{
@@ -3735,6 +4632,18 @@ function initSocket() {{
         el.style.color = '#dc3545';
     }});
     
+    socket.on('video_status_updated', (data) => {{
+        const status = document.getElementById('video-status');
+        if (!status) return;
+        if (data && data.ok) {{
+            status.textContent = T('js.video.streaming');
+            status.style.color = '#28a745';
+        }} else {{
+            status.textContent = T('js.video.stopped');
+            status.style.color = '#dc3545';
+        }}
+    }});
+    
     socket.on('disconnect', () => {{
         console.warn('SocketIO连接断开');
         document.getElementById('socket-status').textContent = T('js.disconnected');
@@ -3775,10 +4684,10 @@ function setGainLevel(level) {{
 }}
 
 function updateGainButtons() {{
-    document.querySelectorAll('.gain-0, .gain-1, .gain-2, .gain-3, .gain-4').forEach((btn, idx) => {{
-        btn.classList.remove('active');
-        if (idx === currentGainLevel) btn.classList.add('active');
-    }});
+    const slider = document.getElementById('gain-slider');
+    if (slider) slider.value = currentGainLevel;
+    const st = document.getElementById('gain-status');
+    if (st && GAIN_LABELS[currentGainLevel] !== undefined) st.textContent = GAIN_LABELS[currentGainLevel];
 }}
 
 function setTuner(state) {{
@@ -3853,10 +4762,72 @@ function setNoiseLevel(level) {{
 }}
 
 function updateNoiseButtons() {{
-    document.querySelectorAll('.noise-0, .noise-1, .noise-2, .noise-3, .noise-4, .noise-5').forEach((btn, idx) => {{
-        btn.classList.remove('active');
-        if (idx === currentNoiseLevel) btn.classList.add('active');
-    }});
+    const slider = document.getElementById('noise-slider');
+    if (slider) slider.value = currentNoiseLevel;
+}}
+
+// 神经网络降噪（DeepFilterNet3，与1-5级谱减法互斥）
+function setAiHint(text, isError) {{
+    const hint = document.querySelector('.ai-hint');
+    if (!hint) {{ return; }}
+    if (text) {{
+        hint.textContent = text;
+        hint.style.color = isError ? '#cc2222' : '';
+    }} else {{
+        hint.textContent = T('ws.ai.hint');
+        hint.style.color = '';
+    }}
+}}
+function setAiDenoise(on) {{
+    if (on === currentAiDenoise && !(aiLoading && !on)) {{ return; }}
+    if (!socket || !socket.connected) {{ alert(T('js.alert.activate_first')); return; }}
+    socket.emit('set_ai_denoise', {{enabled: on}});
+}}
+function toggleAiDenoise() {{ setAiDenoise(!currentAiDenoise); }}
+
+function updateAiUI() {{
+    const on = currentAiDenoise;
+    const sw = document.getElementById('ai-switch');
+    if (sw) {{ sw.classList.toggle('on', on); sw.classList.toggle('loading', aiLoading); }}
+    const lo = document.getElementById('ai-lbl-off');
+    const ln = document.getElementById('ai-lbl-on');
+    if (lo) {{ lo.classList.toggle('active', !on); }}
+    if (ln) {{ ln.classList.toggle('active', on); }}
+    const ar = document.getElementById('ai-atten-row');
+    if (ar) {{ ar.classList.toggle('disabled', !on); }}
+    const asl = document.getElementById('ai-atten-slider');
+    if (asl) {{ asl.disabled = !on; }}
+    // 互斥：AI 开启时禁用谱减法滑块
+    const nc = document.getElementById('noise-control');
+    if (nc) {{
+        nc.style.opacity = on ? '0.45' : '';
+        nc.style.pointerEvents = on ? 'none' : '';
+    }}
+}}
+
+let _aiParamTimer = null;
+function onAiParamInput() {{
+    const attenEl = document.getElementById('ai-atten-slider');
+    if (!attenEl) {{ return; }}
+    currentAiAttenLim = parseInt(attenEl.value, 10);
+    syncAiParamLabels();
+    if (!socket || !socket.connected) {{ return; }}
+    if (_aiParamTimer) {{ clearTimeout(_aiParamTimer); }}
+    const atten = currentAiAttenLim;
+    _aiParamTimer = setTimeout(() => {{
+        socket.emit('set_ai_denoise_params', {{atten_lim_db: atten}});
+    }}, 150);
+}}
+
+function syncAiParamLabels() {{
+    const a = document.getElementById('ai-atten-val');
+    if (a) {{ a.textContent = '-' + Math.round(currentAiAttenLim) + 'dB'; }}
+}}
+
+function syncAiParamSliders() {{
+    const a = document.getElementById('ai-atten-slider');
+    if (a) {{ a.value = String(Math.round(currentAiAttenLim)); }}
+    syncAiParamLabels();
 }}
 
 function setPttMode(mode) {{
@@ -3885,19 +4856,63 @@ function setMicGainLevel(level) {{
 }}
 
 function updateMicGainButtons() {{
-    document.querySelectorAll('.mic-0, .mic-1, .mic-2, .mic-3, .mic-4').forEach((btn, idx) => {{
-        btn.classList.remove('active');
-        if (idx === currentMicGainLevel) btn.classList.add('active');
-    }});
+    const slider = document.getElementById('mic-gain-slider');
+    if (slider) slider.value = currentMicGainLevel;
+    const st = document.getElementById('mic-gain-status');
+    if (st && MIC_GAIN_LABELS[currentMicGainLevel] !== undefined) st.textContent = MIC_GAIN_LABELS[currentMicGainLevel];
 }}
 
 // ===================== WebRTC =====================
 let webrtc_pc = null;
 let webrtc_remoteStream = null;
 let _webrtc_audioEl = null;
+let _webrtc_playSrcIOS = null;
+let _webrtc_playGainIOS = null;
 let _webrtc_reconnectTimer = null;
 let _webrtc_reconnectAttempts = 0;
-const _WEBRTC_MAX_RECONNECT = 10;
+        const _WEBRTC_MAX_RECONNECT = Infinity;
+
+const _IOS_PLAY_BOOST = 1.8;   // iOS 部件状态栏音量下低于其他设备，Web Audio 增益补偿
+
+function _isIOS() {{
+    return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+           (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}}
+
+function _detachRemoteIOS() {{
+    try {{ if (_webrtc_playSrcIOS) _webrtc_playSrcIOS.disconnect(); }} catch(e) {{}}
+    try {{ if (_webrtc_playGainIOS) _webrtc_playGainIOS.disconnect(); }} catch(e) {{}}
+    _webrtc_playSrcIOS = null;
+    _webrtc_playGainIOS = null;
+}}
+
+function _attachRemoteAudio(stream) {{
+    if (!_isIOS()) {{
+        if (!_webrtc_audioEl) {{
+            _webrtc_audioEl = document.createElement('audio');
+            _webrtc_audioEl.id = 'webrtc-audio';
+            _webrtc_audioEl.autoplay = true;
+            document.body.appendChild(_webrtc_audioEl);
+        }}
+        _webrtc_audioEl.srcObject = stream;
+        _webrtc_audioEl.play().catch(e => console.warn('音频自动播放被阻止，需用户交互:', e));
+        return;
+    }}
+    // iOS：HTMLAudio 播放在 iOS 明显偏小，改走 Web Audio + GainNode 增益补偿
+    window.AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!audioContext || audioContext.state === 'closed') {{
+        audioContext = new AudioContext({{ sampleRate: SAMPLING_RATE, latencyHint: 'interactive' }});
+    }}
+    if (audioContext.state === 'suspended') {{
+        audioContext.resume().catch(e => console.warn('iOS AudioContext 未激活:', e));
+    }}
+    _detachRemoteIOS();   // 重连/换流时断开旧接线
+    _webrtc_playSrcIOS = audioContext.createMediaStreamSource(stream);
+    _webrtc_playGainIOS = audioContext.createGain();
+    _webrtc_playGainIOS.gain.value = _IOS_PLAY_BOOST;
+    _webrtc_playSrcIOS.connect(_webrtc_playGainIOS);
+    _webrtc_playGainIOS.connect(audioContext.destination);
+}}
 
 function _webrtc_scheduleReconnect() {{
     if (_webrtc_reconnectTimer) clearTimeout(_webrtc_reconnectTimer);
@@ -3978,14 +4993,7 @@ async function initWebRTC() {{
             webrtc_remoteStream = event.streams[0];
             
             if (event.track.kind === 'audio') {{
-                if (!_webrtc_audioEl) {{
-                    _webrtc_audioEl = document.createElement('audio');
-                    _webrtc_audioEl.id = 'webrtc-audio';
-                    _webrtc_audioEl.autoplay = true;
-                    document.body.appendChild(_webrtc_audioEl);
-                }}
-                _webrtc_audioEl.srcObject = webrtc_remoteStream;
-                _webrtc_audioEl.play().catch(e => console.warn('音频自动播放被阻止，需用户交互:', e));
+                _attachRemoteAudio(webrtc_remoteStream);
             }}
             if (event.track.kind === 'video') {{
                 const videoEl = document.getElementById('video-display');
@@ -4147,7 +5155,10 @@ async function restartAudio() {{
     if (micStream) {{ micStream.getTracks().forEach(t => t.stop()); micStream = null; }}
     if (webrtc_pc) {{ try {{ webrtc_pc.close(); }} catch(e) {{}} webrtc_pc = null; }}
     if (_webrtc_reconnectTimer) {{ clearTimeout(_webrtc_reconnectTimer); _webrtc_reconnectTimer = null; }}
-    if (_webrtc_audioEl) {{ _webrtc_audioEl.srcObject = null; }}
+if (_webrtc_audioEl) {{
+        _webrtc_audioEl.srcObject = null;
+    }}
+    _detachRemoteIOS();
     isPTTHeld = false;
     try {{
         await fetch(`/api/audio_restart`, {{method:"POST"}});
@@ -4334,15 +5345,28 @@ function showChannelManager() {{
             for (const ch of channelData[band]) {{
                 const item = document.createElement('div');
                 item.className = 'channel-item';
-                item.innerHTML = `
-                    <div class="channel-item-info" onclick="selectChannelByKey('${{ch.key}}')">
-                        <div class="channel-item-name">${{ch.freq}} MHz / ${{ch.mode}}</div>
-                    </div>
-                    <div class="channel-item-btns">
-                        <button onclick="event.stopPropagation();editChannelUI('${{ch.key}}')">✏️</button>
-                        <button onclick="event.stopPropagation();deleteChannelConfirm('${{ch.key}}')">🗑️</button>
-                    </div>
-                `;
+
+                const info = document.createElement('div');
+                info.className = 'channel-item-info';
+                info.onclick = () => selectChannelByKey(ch.key);
+                const nameEl = document.createElement('div');
+                nameEl.className = 'channel-item-name';
+                nameEl.textContent = `${{ch.freq}} MHz / ${{ch.mode}}`;
+                info.appendChild(nameEl);
+
+                const btns = document.createElement('div');
+                btns.className = 'channel-item-btns';
+                const editBtn = document.createElement('button');
+                editBtn.textContent = '✏️';
+                editBtn.onclick = (e) => {{ e.stopPropagation(); editChannelUI(ch.key); }};
+                const delBtn = document.createElement('button');
+                delBtn.textContent = '🗑️';
+                delBtn.onclick = (e) => {{ e.stopPropagation(); deleteChannelConfirm(ch.key); }};
+                btns.appendChild(editBtn);
+                btns.appendChild(delBtn);
+
+                item.appendChild(info);
+                item.appendChild(btns);
                 list.appendChild(item);
             }}
         }}
@@ -4535,27 +5559,66 @@ window.addEventListener('beforeunload', () => {{ if (socket) socket.disconnect()
 '''
 
 # ===================== GUI 主窗口 =====================
+class RoundedButton(tk.Canvas):
+    """Apple 风格圆角矩形按钮（Canvas 绘制，支持悬停变色）"""
+
+    def __init__(self, parent, text="", command=None,
+                 bg="#007aff", fg="#ffffff", hover_bg=None,
+                 font=("Microsoft YaHei", 9), padx=14, pady=5,
+                 radius=10, min_width=0, cursor="hand2", **kw):
+        self._font = tkfont.Font(font=font)
+        h = self._font.metrics("linespace") + pady * 2
+        w = max(min_width, self._font.measure(text) + padx * 2)
+        try:
+            pbg = parent.cget("bg")
+        except Exception:
+            pbg = "#ffffff"
+        super().__init__(parent, width=w, height=h, highlightthickness=0,
+                         bd=0, bg=pbg, cursor=cursor, **kw)
+        self._command = command
+        self._bg = bg
+        self._hover = hover_bg or bg
+        r = min(radius, h // 2)
+        self._shape = self._round_rect(1, 1, w - 1, h - 1, r, fill=bg)
+        self.create_text(w / 2, h / 2, text=text, fill=fg, font=font)
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", lambda e: self.itemconfigure(self._shape, fill=self._hover))
+        self.bind("<Leave>", lambda e: self.itemconfigure(self._shape, fill=self._bg))
+
+    def _round_rect(self, x1, y1, x2, y2, r, **kw):
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return self.create_polygon(pts, smooth=True, **kw)
+
+    def _on_click(self, _e=None):
+        if callable(self._command):
+            self._command()
+
+
 class FT710ServerGUI:
-    VERSION = "2.1"
+    VERSION = "2.2.2"
     EMAIL = "ruibaow@outlook.com"
     QQ_GROUP = "232934024"
     
     C = {
-        "bg":         "#dce8f5",
-        "glass":      "#eef4fc",
-        "glass2":     "#e2eef8",
-        "border":     "#b8d0ea",
-        "sep":        "#c8ddf0",
-        "accent":     "#1a7fcb",
-        "accent2":    "#0a5fa0",
-        "text":       "#1a2a3a",
-        "text2":      "#3a5570",
-        "text3":      "#6a8aaa",
-        "ok":         "#12875c",
-        "err":        "#cc2222",
-        "warn":       "#b06a00",
-        "btn":        "#1a7fcb",
+        "bg":         "#f2f2f7",
+        "glass":      "#ffffff",
+        "glass2":     "#f2f2f7",
+        "border":     "#e3e3e8",
+        "sep":        "#d1d1d6",
+        "accent":     "#007aff",
+        "accent2":    "#0060df",
+        "text":       "#1c1c1e",
+        "text2":      "#3a3a3c",
+        "text3":      "#8e8e93",
+        "ok":         "#34c759",
+        "err":        "#ff3b30",
+        "warn":       "#ff9500",
+        "btn":        "#007aff",
         "btn_fg":     "#ffffff",
+        "btn_sec":       "#e9e9ee",
+        "btn_sec_fg":    "#007aff",
+        "btn_sec_hover": "#dcdce3",
     }
 
     def __init__(self):
@@ -4816,7 +5879,7 @@ class FT710ServerGUI:
         save_config(config)
         self._apply_language()
         try:
-            socketio.emit('set_lang', {'code': code}, namespace='/', broadcast=True)
+            socketio.emit('set_lang', {'code': code}, namespace='/')
         except Exception:
             pass
         log(_t('log.lang.switch', lang=code))
@@ -4871,12 +5934,36 @@ class FT710ServerGUI:
         dlg.resizable(False, False)
         dlg.configure(bg=self.C["bg"])
         dlg.grab_set()
+        try:
+            dlg.update_idletasks()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+            x = rx + max(0, (rw - w) // 2)
+            y = ry + max(0, (rh - h) // 3)
+            sw = dlg.winfo_screenwidth()
+            sh = dlg.winfo_screenheight()
+            x = min(max(0, x), max(0, sw - w))
+            y = min(max(0, y), max(0, sh - h))
+            dlg.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        # Windows 11：圆角化对话框（Win10 上无效但不报错）
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(dlg.winfo_id())
+            pref = ctypes.c_int(2)  # DWMWCP_ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref))  # DWMWA_WINDOW_CORNER_PREFERENCE
+        except Exception:
+            pass
         tk.Frame(dlg, bg=self.C["accent"], height=3).pack(fill="x")
         return dlg
 
     def _dialog_com(self):
         C = self.C
-        dlg = self._styled_dialog(_t('dlg.com.title'), 340, 210)
+        dlg = self._styled_dialog(_t('dlg.com.title'), 400, 250)
 
         card = tk.Frame(dlg, bg=C["glass"],
                         highlightbackground=C["border"], highlightthickness=1,
@@ -4897,8 +5984,9 @@ class FT710ServerGUI:
                  font=("Microsoft YaHei", 9)).grid(row=0, column=0, sticky="w", padx=4, pady=6)
         port_var = tk.StringVar(value=cur_port)
         cb_port = ttk.Combobox(card, textvariable=port_var, values=port_list,
-                               width=13, state="readonly", font=("Microsoft YaHei", 10))
-        cb_port.grid(row=0, column=1, padx=8, pady=6)
+                               width=22, state="readonly", font=("Microsoft YaHei", 10))
+        cb_port.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
+        card.columnconfigure(1, weight=1)
 
         def _refresh():
             try:
@@ -4911,18 +5999,21 @@ class FT710ServerGUI:
                 log(_t('log.port.refresh', l=pl))
             except Exception as e:
                 log(_t('log.port.refresh.fail', e=e))
-        tk.Button(card, text="🔄", command=_refresh,
-                  bg=C["btn"], fg=C["btn_fg"], font=("Microsoft YaHei", 9),
-                  relief="flat", padx=6, cursor="hand2").grid(row=0, column=2, padx=2)
+
+        ref_row = tk.Frame(card, bg=C["glass"])
+        ref_row.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 2))
+        RoundedButton(ref_row, text="🔄 " + _t('btn.refresh.short'), command=_refresh,
+                      bg=C["btn_sec"], fg=C["btn_sec_fg"], hover_bg=C["btn_sec_hover"],
+                      font=("Microsoft YaHei", 8), padx=10, pady=3, radius=8).pack(side="left")
 
         tk.Label(card, text=_t('lbl.baud'), bg=C["glass"], fg=C["text2"],
-                 font=("Microsoft YaHei", 9)).grid(row=1, column=0, sticky="w", padx=4, pady=6)
+                 font=("Microsoft YaHei", 9)).grid(row=2, column=0, sticky="w", padx=4, pady=6)
         e_baud = tk.Entry(card, font=("Microsoft YaHei", 10), width=14,
                           bg="#fff", fg=C["text"], insertbackground=C["text"],
                           relief="flat",
                           highlightbackground=C["border"], highlightthickness=1)
         e_baud.insert(0, config['SERIAL']['BAUD_RATE'])
-        e_baud.grid(row=1, column=1, padx=8, pady=6)
+        e_baud.grid(row=2, column=1, sticky="w", padx=8, pady=6)
 
         def _apply():
             port = port_var.get().strip()
@@ -4941,12 +6032,10 @@ class FT710ServerGUI:
             log(_t('log.port.ok' if ok else 'log.port.fail', p=port, b=baud))
             dlg.destroy()
 
-        btn = tk.Button(dlg, text=_t('btn.apply.reconn'), command=_apply,
-                        bg=C["btn"], fg=C["btn_fg"],
-                        font=("Microsoft YaHei", 10), relief="flat",
-                        padx=16, pady=5, cursor="hand2",
-                        activebackground=C["accent2"], activeforeground="#fff")
-        btn.pack(pady=4)
+        RoundedButton(dlg, text=_t('btn.apply.reconn'), command=_apply,
+                      bg=C["btn"], fg=C["btn_fg"], hover_bg=C["accent2"],
+                      font=("Microsoft YaHei", 10), padx=20, pady=6,
+                      radius=10).pack(pady=6)
 
     def _reconnect_com(self):
         C = self.C
@@ -4966,126 +6055,163 @@ class FT710ServerGUI:
 
     def _dialog_audio(self):
         C = self.C
-        dlg = self._styled_dialog(_t('dlg.audio.title'), 650, 260)
+        dlg = self._styled_dialog(_t('dlg.audio.title'), 780, 360)
 
         card = tk.Frame(dlg, bg=C["glass"],
                         highlightbackground=C["border"], highlightthickness=1,
                         pady=12, padx=18)
-        card.pack(fill="x", padx=12, pady=10)
+        card.pack(fill="x", padx=14, pady=8)
+        card.columnconfigure(1, weight=1)
 
-        try:
-            devices = sd.query_devices()
-            input_devices = []
-            output_devices = []
-            for i, d in enumerate(devices):
-                dev_name = d.get('name', f'Device#{i}')
-                if d.get('max_input_channels', 0) > 0:
-                    input_devices.append((i, dev_name))
-                if d.get('max_output_channels', 0) > 0:
-                    output_devices.append((i, dev_name))
-        except Exception as e:
-            messagebox.showerror(_t('err.title'), _t('err.audio.dev', e=e), parent=dlg)
-            return
+        sys_default = _t('lbl.sys.default')
+        input_devices = []
+        output_devices = []
+
+        def _scan(silent=False):
+            """重查声卡设备列表，返回是否成功；成功后更新 input/output 列表"""
+            try:
+                devices = sd.query_devices()
+                ins, outs = [], []
+                for i, d in enumerate(devices):
+                    dev_name = d.get('name', f'Device#{i}')
+                    if d.get('max_input_channels', 0) > 0:
+                        ins.append((i, dev_name))
+                    if d.get('max_output_channels', 0) > 0:
+                        outs.append((i, dev_name))
+            except Exception as e:
+                msg = _t('log.audio.refresh.fail', e=e)
+                log(msg)
+                if not silent:
+                    messagebox.showerror(_t('err.title'), msg, parent=dlg)
+                return False
+            nonlocal input_devices, output_devices
+            input_devices = ins
+            output_devices = outs
+            return True
 
         cur_device_in = int(config['AUDIO'].get('DEVICE_IN', -1))
         cur_device_out = int(config['AUDIO'].get('DEVICE_OUT', -1))
 
+        in_var = tk.StringVar()
+        out_var = tk.StringVar()
+
+        def _repopulate(cb, var, pairs, cur_dev):
+            values = [sys_default] + [name for i, name in pairs]
+            indices = [-1] + [i for i, name in pairs]
+            cb['values'] = values
+            idx = 0
+            if cur_dev in indices:
+                idx = indices.index(cur_dev)
+            try:
+                var.set(values[idx])
+                cb.current(idx)
+            except Exception:
+                var.set(values[0])
+                cb.current(0)
+
+        if _scan() is False:
+            return
+
         tk.Label(card, text=_t('lbl.input.dev'), bg=C["glass"], fg=C["text2"],
                  font=("Microsoft YaHei", 9)).grid(row=0, column=0, sticky="w", padx=4, pady=6)
-        
-        sys_default = _t('lbl.sys.default')
-        in_values = [sys_default] + [name for i, name in input_devices]
-        in_indices = [-1] + [i for i, name in input_devices]
-        
-        cur_in_idx = 0
-        if cur_device_in in in_indices:
-            cur_in_idx = in_indices.index(cur_device_in)
-        
-        cb_in = ttk.Combobox(card, values=in_values,
-                             width=55, state="readonly", font=("Microsoft YaHei", 10))
+
+        cb_in = ttk.Combobox(card, textvariable=in_var, width=42, state="readonly",
+                             font=("Microsoft YaHei", 10))
         cb_in.grid(row=0, column=1, columnspan=2, sticky="ew", padx=8, pady=6)
-        try:
-            cb_in.current(cur_in_idx)
-        except:
-            cb_in.current(0)
+        _repopulate(cb_in, in_var, input_devices, cur_device_in)
 
         tk.Label(card, text=_t('lbl.output.dev'), bg=C["glass"], fg=C["text2"],
                  font=("Microsoft YaHei", 9)).grid(row=1, column=0, sticky="w", padx=4, pady=6)
-        
-        out_values = [sys_default] + [name for i, name in output_devices]
-        out_indices = [-1] + [i for i, name in output_devices]
-        
-        cur_out_idx = 0
-        if cur_device_out in out_indices:
-            cur_out_idx = out_indices.index(cur_device_out)
-        
-        cb_out = ttk.Combobox(card, values=out_values,
-                              width=55, state="readonly", font=("Microsoft YaHei", 10))
+
+        cb_out = ttk.Combobox(card, textvariable=out_var, width=42, state="readonly",
+                              font=("Microsoft YaHei", 10))
         cb_out.grid(row=1, column=1, columnspan=2, sticky="ew", padx=8, pady=6)
-        try:
-            cb_out.current(cur_out_idx)
-        except:
-            cb_out.current(0)
+        _repopulate(cb_out, out_var, output_devices, cur_device_out)
+
+        def _refresh_devices():
+            if not _scan(silent=True):
+                return
+            prev_in, prev_out = in_var.get(), out_var.get()
+            _repopulate(cb_in, in_var, input_devices, cur_device_in)
+            _repopulate(cb_out, out_var, output_devices, cur_device_out)
+            nv_in = [sys_default] + [name for i, name in input_devices]
+            nv_out = [sys_default] + [name for i, name in output_devices]
+            if prev_in in nv_in:
+                in_var.set(prev_in)
+                cb_in.current(nv_in.index(prev_in))
+            if prev_out in nv_out:
+                out_var.set(prev_out)
+                cb_out.current(nv_out.index(prev_out))
+            log(_t('log.audio.refresh', a=len(input_devices), b=len(output_devices)))
+
+        ref_frame = tk.Frame(card, bg=C["glass"])
+        ref_frame.grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=(10, 2))
+        RoundedButton(ref_frame, text="🔄 " + _t('btn.refresh.short'), command=_refresh_devices,
+                      bg=C["btn_sec"], fg=C["btn_sec_fg"], hover_bg=C["btn_sec_hover"],
+                      font=("Microsoft YaHei", 8), padx=10, pady=3, radius=8).pack(side="left")
+        tk.Label(ref_frame, text=_t('lbl.refresh.hint'), bg=C["glass"], fg=C["text3"],
+                 font=("Microsoft YaHei", 8)).pack(side="left", padx=8)
 
         def _apply():
-            in_sel = cb_in.get()
-            out_sel = cb_out.get()
-            
+            in_sel = in_var.get()
+            out_sel = out_var.get()
+
             dev_in = -1
             dev_out = -1
-            
+
             if in_sel and in_sel != sys_default:
                 for i, name in input_devices:
                     if name == in_sel:
                         dev_in = i
                         break
-            
+
             if out_sel and out_sel != sys_default:
                 for i, name in output_devices:
                     if name == out_sel:
                         dev_out = i
                         break
-              
+
             config['AUDIO']['DEVICE_IN'] = str(dev_in)
             config['AUDIO']['DEVICE_OUT'] = str(dev_out)
             save_config(config)
-            
+
             log(_t('log.save.audio', a=dev_in, b=dev_out))
-            
+
             ok = restart_audio_streams()
-            
+
             self._lbl_audio._lbl.config(
                 text=_t('st.audio.ready') if ok else _t('st.audio.init'),
                 fg=C["ok"] if ok else C["err"])
-            
+
             log(_t('log.audio.ok' if ok else 'log.audio.fail'))
-            
+
             if ok:
                 dlg.destroy()
 
-        btn = tk.Button(dlg, text=_t('btn.apply.audio'), command=_apply,
-                        bg=C["btn"], fg=C["btn_fg"],
-                        font=("Microsoft YaHei", 10), relief="flat",
-                        padx=16, pady=5, cursor="hand2",
-                        activebackground=C["accent2"], activeforeground="#fff")
-        btn.pack(pady=8)
+        RoundedButton(dlg, text=_t('btn.apply.audio'), command=_apply,
+                      bg=C["btn"], fg=C["btn_fg"], hover_bg=C["accent2"],
+                      font=("Microsoft YaHei", 10), padx=20, pady=6,
+                      radius=10).pack(pady=8)
 
     def _dialog_video(self):
         """视频设备配置对话框"""
         C = self.C
-        dlg = self._styled_dialog(_t('dlg.video.title'), 420, 320)
+        dlg = self._styled_dialog(_t('dlg.video.title'), 540, 440)
 
         if not CV2_AVAILABLE:
             tk.Label(dlg, text=_t('lbl.video.nocv'),
                      bg=C["glass"], fg=C["err"], font=("Microsoft YaHei", 10)).pack(pady=20)
-            tk.Button(dlg, text=_t('btn.close'), command=dlg.destroy,
-                      bg=C["glass"], fg=C["text"], font=("Microsoft YaHei", 10)).pack()
+            RoundedButton(dlg, text=_t('btn.close'), command=dlg.destroy,
+                          bg=C["btn_sec"], fg=C["btn_sec_fg"], hover_bg=C["btn_sec_hover"],
+                          font=("Microsoft YaHei", 10), padx=18, pady=5,
+                          radius=10).pack(pady=6)
             return
 
         card = tk.Frame(dlg, bg=C["glass"],
                         highlightbackground=C["border"], highlightthickness=1,
                         pady=12, padx=18)
-        card.pack(fill="x", padx=12, pady=10)
+        card.pack(fill="x", padx=14, pady=8)
+        card.columnconfigure(1, weight=1)
 
         # 存储控件引用
         widgets = {'res_var': None, 'quality_var': None, 'chk_enabled': None}
@@ -5094,10 +6220,14 @@ class FT710ServerGUI:
         quality_var = tk.StringVar(value=config['VIDEO'].get('QUALITY', '15'))
         chk_enabled_var = tk.BooleanVar(value=config['VIDEO'].get('ENABLED', 'false').lower() == 'true')
 
-        result = {'devices': [], 'ready': False}
+        result = {'devices': [], 'ready': False, 'scanning': False}
 
         def scan_and_show():
-            # 后台扫描
+            # 后台扫描（可重复点“刷新设备”触发，扫描中防重入）
+            if result['scanning']:
+                return
+            result['scanning'] = True
+            lbl_scan.config(text=_t('lbl.scanning'))
             devices = []
             for i in range(5):
                 try:
@@ -5109,27 +6239,28 @@ class FT710ServerGUI:
                     pass
             result['devices'] = devices
             result['ready'] = True
+            result['scanning'] = False
             # 更新UI
             dlg.after(0, lambda: update_device_list(devices))
 
         def update_device_list(devices):
-            # 清除扫描提示
+            # 清除扫描提示/旧设备行
             for w in card.grid_slaves():
-                if w.grid_info().get('row') == 0:
+                if w.grid_info().get('row') == 1:
                     w.destroy()
-            
+
             # 设备列表
             tk.Label(card, text=_t('lbl.camera'), bg=C["glass"], fg=C["text2"],
-                     font=("Microsoft YaHei", 9)).grid(row=0, column=0, sticky="w", padx=4, pady=6)
-            
+                     font=("Microsoft YaHei", 9)).grid(row=1, column=0, sticky="w", padx=4, pady=6)
+
             # 读取上次保存的设备索引
             saved_device = int(config['VIDEO'].get('DEVICE_INDEX', 0))
-            
+
             if devices:
                 values = [_t('lbl.device', i=i) for i in devices]
                 cb = ttk.Combobox(card, values=values, state="readonly", font=("Microsoft YaHei", 9))
-                cb.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
-                
+                cb.grid(row=1, column=1, sticky="ew", padx=8, pady=6)
+
                 # 选中和上次相同的设备，如果没有则选第一个
                 if saved_device in devices:
                     cb.current(devices.index(saved_device))
@@ -5137,44 +6268,52 @@ class FT710ServerGUI:
                 else:
                     cb.current(0)
                     device_var.set(str(devices[0]))
-                
+
                 cb.bind('<<ComboboxSelected>>', lambda e: device_var.set(str(devices[cb.current()])))
+                lbl_scan.config(text=f"{len(devices)} × " + _t('lbl.camera'))
             else:
                 tk.Label(card, text=_t('lbl.no.dev'), bg=C["glass"], fg=C["err"],
-                         font=("Microsoft YaHei", 9)).grid(row=0, column=1, sticky="w", padx=8, pady=6)
-            
+                         font=("Microsoft YaHei", 9)).grid(row=1, column=1, sticky="w", padx=8, pady=6)
+                lbl_scan.config(text=_t('lbl.no.dev'))
+
             card.columnconfigure(1, weight=1)
 
-        # 显示扫描中
-        tk.Label(card, text=_t('lbl.scanning'), bg=C["glass"], fg=C["text3"],
-                 font=("Microsoft YaHei", 9)).grid(row=0, column=0, columnspan=2, pady=10)
+        def _start_scan():
+            _gui_threading.Thread(target=scan_and_show, daemon=True).start()
 
-        # 分辨率 - 改为下拉框，只提供两个选项
+        # 工具栏：刷新 + 状态提示（始终保留，不受设备列表刷新影响）
+        toolbar = tk.Frame(card, bg=C["glass"])
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
+        RoundedButton(toolbar, text="🔄 " + _t('btn.refresh.short'), command=_start_scan,
+                      bg=C["btn_sec"], fg=C["btn_sec_fg"], hover_bg=C["btn_sec_hover"],
+                      font=("Microsoft YaHei", 8), padx=10, pady=3, radius=8).pack(side="left")
+        lbl_scan = tk.Label(toolbar, text=_t('lbl.scanning'), bg=C["glass"], fg=C["text3"],
+                            font=("Microsoft YaHei", 8))
+        lbl_scan.pack(side="left", padx=8)
+
+        # 分辨率
         tk.Label(card, text=_t('lbl.res'), bg=C["glass"], fg=C["text2"],
-                 font=("Microsoft YaHei", 9)).grid(row=1, column=0, sticky="w", padx=4, pady=6)
-        res_var = tk.StringVar(value="{}x{}".format(
-            config['VIDEO'].get('WIDTH', '320'),
-            config['VIDEO'].get('HEIGHT', '240')))
-        res_cb = ttk.Combobox(card, values=["320x240", "800x600"], 
+                 font=("Microsoft YaHei", 9)).grid(row=2, column=0, sticky="w", padx=4, pady=6)
+        res_cb = ttk.Combobox(card, values=["640x480", "800x600", "1280x720", "1920x1080"],
                             textvariable=res_var, state="readonly", font=("Microsoft YaHei", 9))
-        res_cb.grid(row=1, column=1, sticky="w", padx=8, pady=6)
+        res_cb.grid(row=2, column=1, sticky="ew", padx=8, pady=6)
         res_cb.bind('<<ComboboxSelected>>', lambda e: res_var.set(res_cb.get()))
 
         # 帧率
         tk.Label(card, text=_t('lbl.fps'), bg=C["glass"], fg=C["text2"],
-                 font=("Microsoft YaHei", 9)).grid(row=2, column=0, sticky="w", padx=4, pady=6)
+                 font=("Microsoft YaHei", 9)).grid(row=3, column=0, sticky="w", padx=4, pady=6)
         fps_var = tk.StringVar(value=config['VIDEO'].get('FPS', '15'))
         fps_frame = tk.Frame(card, bg=C["glass"])
-        fps_frame.grid(row=2, column=1, sticky="w", padx=8, pady=6)
+        fps_frame.grid(row=3, column=1, sticky="ew", padx=8, pady=6)
         tk.Entry(fps_frame, textvariable=fps_var, font=("Microsoft YaHei", 10), width=10).pack(side="left")
         tk.Label(fps_frame, text="(1-60)", bg=C["glass"], fg=C["text3"],
                  font=("Microsoft YaHei", 8)).pack(side="left", padx=4)
 
         # 质量
         tk.Label(card, text=_t('lbl.jpeg'), bg=C["glass"], fg=C["text2"],
-                 font=("Microsoft YaHei", 9)).grid(row=3, column=0, sticky="w", padx=4, pady=6)
+                 font=("Microsoft YaHei", 9)).grid(row=4, column=0, sticky="w", padx=4, pady=6)
         quality_frame = tk.Frame(card, bg=C["glass"])
-        quality_frame.grid(row=3, column=1, sticky="w", padx=8, pady=6)
+        quality_frame.grid(row=4, column=1, sticky="ew", padx=8, pady=6)
         tk.Entry(quality_frame, textvariable=quality_var, font=("Microsoft YaHei", 10), width=10).pack(side="left")
         tk.Label(quality_frame, text=_t('lbl.quality.hint'), bg=C["glass"], fg=C["text3"],
                  font=("Microsoft YaHei", 8)).pack(side="left", padx=4)
@@ -5182,10 +6321,10 @@ class FT710ServerGUI:
         # 启用
         tk.Checkbutton(card, text=_t('lbl.enable.video'), bg=C["glass"], fg=C["text"],
                        font=("Microsoft YaHei", 10), variable=chk_enabled_var).grid(
-                           row=4, column=0, columnspan=2, sticky="w", pady=8)
+                           row=5, column=0, columnspan=2, sticky="w", pady=8)
 
         # 启动扫描线程
-        _gui_threading.Thread(target=scan_and_show, daemon=True).start()
+        _start_scan()
 
         def _apply():
             device_idx = int(device_var.get() or 0)
@@ -5193,8 +6332,8 @@ class FT710ServerGUI:
                 w, h = res_var.get().split('x')
                 width, height = int(w), int(h)
             except:
-                width, height = 320, 240
-            
+                width, height = 640, 480
+
             try:
                 fps_val = max(1, min(60, int(fps_var.get())))
             except:
@@ -5203,7 +6342,7 @@ class FT710ServerGUI:
                 quality_val = max(2, min(31, int(quality_var.get())))
             except:
                 quality_val = 15
-            
+
             config['VIDEO']['ENABLED'] = 'true' if chk_enabled_var.get() else 'false'
             config['VIDEO']['DEVICE_INDEX'] = str(device_idx)
             config['VIDEO']['WIDTH'] = str(width)
@@ -5211,22 +6350,20 @@ class FT710ServerGUI:
             config['VIDEO']['FPS'] = str(fps_val)
             config['VIDEO']['QUALITY'] = str(quality_val)
             save_config(config)
-            
+
             stop_video_stream()
             if chk_enabled_var.get():
                 # 使用新配置启动视频流
                 start_video_stream()
-            
+
             log(_t('log.video.set', s=_t('log.video.on' if chk_enabled_var.get() else 'log.video.off'),
                     d=device_idx, w=width, h=height, fps=fps_val, q=quality_val))
             dlg.destroy()
 
-        btn = tk.Button(dlg, text=_t('btn.apply'), command=_apply,
-                        bg=C["btn"], fg=C["btn_fg"],
-                        font=("Microsoft YaHei", 10), relief="flat",
-                        padx=20, pady=5, cursor="hand2",
-                        activebackground=C["accent2"], activeforeground="#fff")
-        btn.pack(pady=8)
+        RoundedButton(dlg, text=_t('btn.apply'), command=_apply,
+                      bg=C["btn"], fg=C["btn_fg"], hover_bg=C["accent2"],
+                      font=("Microsoft YaHei", 10), padx=22, pady=6,
+                      radius=10).pack(pady=8)
 
     def _clear_console(self):
         self._console.configure(state="normal")
@@ -5265,11 +6402,10 @@ class FT710ServerGUI:
                  bg=C["glass"], fg=C["text3"],
                  font=("Microsoft YaHei", 10)).pack(pady=(8, 0))
 
-        tk.Button(dlg, text=_t('btn.close'), command=dlg.destroy,
-                  bg=C["glass2"], fg=C["text"],
-                  font=("Microsoft YaHei", 10), relief="flat",
-                  padx=20, pady=4, cursor="hand2",
-                  activebackground=C["border"]).pack(pady=8)
+        RoundedButton(dlg, text=_t('btn.close'), command=dlg.destroy,
+                      bg=C["btn_sec"], fg=C["btn_sec_fg"], hover_bg=C["btn_sec_hover"],
+                      font=("Microsoft YaHei", 10), padx=18, pady=5,
+                      radius=10).pack(pady=8)
 
     def _on_close(self):
         if messagebox.askokcancel(_t('exit.title'), _t('exit.confirm')):
@@ -5703,6 +6839,12 @@ async def handle_webrtc_audio(track, pc=None, conn_gen=None):
             try:
                 _tx_audio_queue.put_nowait(audio_f32)
             except _queue.Full:
+                # 队列满：正常情况下消费者应跟上；频繁触发说明TX写声卡卡顿，
+                # 丢帧不再静默——计数并按 100 帧节流上报，便于排查发射变调/断续
+                global _mic_skip_count
+                _mic_skip_count += 1
+                if _mic_skip_count % 100 == 1:
+                    log(f"TX音频队列满，丢最旧帧（累计{_mic_skip_count}）")
                 try:
                     _tx_audio_queue.get_nowait()
                 except:
